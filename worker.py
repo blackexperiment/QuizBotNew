@@ -1,168 +1,208 @@
 # worker.py
 import time
 import logging
-import re
 from typing import List, Dict, Any, Optional
+
+from telegram import Bot
+from telegram.error import RetryAfter, TelegramError
+
+# if you have db.mark_job_done, try to use it for idempotency; otherwise we'll use in-memory guard
+import db
 
 logger = logging.getLogger("quizbot.worker")
 
+# in-process notified guard (avoid duplicate final confirmations)
+_notified_jobs = set()
 
-def _send_with_retries(bot, method_name: str, max_retries: int = 4, *args, **kwargs):
+def _letter_to_index(letter: str, ordered_labels: List[str]) -> Optional[int]:
     """
-    Generic helper to call bot methods with retry handling for RetryAfter (429) and transient errors.
-    Returns the method result if successful, else raises the last exception.
+    Map option letter like 'A' to index in ordered_labels list (ordered_labels contains labels like ['A','B','C'...'])
     """
-    attempt = 0
-    backoff = 1.0
-    while True:
-        attempt += 1
-        try:
-            method = getattr(bot, method_name)
-            return method(*args, **kwargs)
-        except Exception as e:
-            # Try to detect RetryAfter
-            retry_after = getattr(e, "retry_after", None)
-            if retry_after is None:
-                m = re.search(r"retry after (\d+)", str(e), flags=re.IGNORECASE)
-                if m:
-                    try:
-                        retry_after = int(m.group(1))
-                    except Exception:
-                        retry_after = None
-
-            if retry_after:
-                logger.warning("API asked to retry after %s seconds (attempt %s/%s). Sleeping...", retry_after, attempt, max_retries)
-                time.sleep(int(retry_after) + 1)
-            else:
-                logger.exception("Transient error calling %s (attempt %s/%s): %s", method_name, attempt, max_retries, e)
-                if attempt >= max_retries:
-                    logger.error("Exceeded retries for %s", method_name)
-                    raise
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60.0)
-
-
-def _options_list_from_question(qobj: Dict[str, Any]) -> List[str]:
-    labels = sorted(qobj.get("options", {}).keys())
-    return [qobj["options"][lbl] for lbl in labels if lbl in qobj["options"]]
-
-
-def _correct_option_index(qobj: Dict[str, Any]) -> int:
-    ans = qobj.get("ans")
-    if not ans:
-        return 0
-    labels = sorted(qobj.get("options", {}).keys())
+    letter_u = (letter or "").strip().upper()
+    if not letter_u:
+        return None
     try:
-        return labels.index(ans.upper())
-    except Exception:
-        return 0
+        return ordered_labels.index(letter_u)
+    except ValueError:
+        return None
 
-
-def post_quiz_sequence(
-    bot,
+def post_sequence(
+    bot: Bot,
     chat_id: int,
     sequence: List[Dict[str, Any]],
-    anonymous: bool,
+    is_anonymous: bool = False,
     owner_id: Optional[int] = None,
     chat_name: Optional[str] = None,
-    poll_delay_short: int = 1,
-    poll_delay_long: int = 2,
+    poll_delay_short: float = 1.0,
+    poll_delay_long: float = 2.0,
     max_retries: int = 4,
     sequential_fail_abort: int = 3,
-) -> bool:
+    job_id: Optional[str] = None
+) -> int:
     """
-    Posts a parsed sequence (validator-produced) into target chat.
-    sequence: list of items with type 'des' or 'question'
-    Returns True on success, False on abort/failure.
+    Post the sequence (list of dicts) into chat_id.
+    sequence items:
+     - {"type":"des", "text": "..."}
+     - {"type":"question", "raw_question": "...", "options": {"A":"...","B":"..."}, "ans":"A", "exp":"..."}
+    Returns number of polls successfully sent (int) or 0 on failure.
     """
-    questions_sent = 0
+    sent_count = 0
     consecutive_failures = 0
-    total_questions = len([x for x in sequence if x.get("type") == "question"])
 
     for idx, item in enumerate(sequence, start=1):
         try:
             if item.get("type") == "des":
-                text = item.get("text", "")
-                if text:
-                    logger.info("Sending DES (at sequence pos %s) to %s", idx, chat_id)
-                    _send_with_retries(bot, "send_message", max_retries=max_retries, chat_id=chat_id, text=text)
+                # send DES as a normal message in-order
+                try:
+                    bot.send_message(chat_id=chat_id, text=item.get("text", ""))
+                except Exception:
+                    logger.exception("Failed to send DES at index %s", idx)
+                # continue to next element
                 continue
 
             if item.get("type") == "question":
-                q = item.get("question", {})
-                options = _options_list_from_question(q)
-                if not options:
-                    logger.warning("Skipping question with no options: %s", q.get("raw_question"))
+                qtext = item.get("raw_question") or item.get("question") or ""
+                options_map = item.get("options", {}) or {}
+                # Order options by sorted label A,B,C... to maintain consistency
+                ordered_labels = sorted(options_map.keys())
+                # Build list of option texts preserving alphabetical label order
+                option_texts = [options_map.get(lbl, "") for lbl in ordered_labels]
+                # map ANS letter to index in that list
+                ans_letter = (item.get("ans") or "").strip().upper()
+                correct_index = _letter_to_index(ans_letter, ordered_labels)
+                # validation: require at least 2 options and correct_index valid
+                if len(option_texts) < 2 or correct_index is None:
+                    logger.error("Invalid question format at seq index %s: options=%s ans=%s", idx, ordered_labels, ans_letter)
+                    # treat as failure and continue or abort according to policy
+                    consecutive_failures += 1
+                    if consecutive_failures >= sequential_fail_abort:
+                        # abort job and notify owner
+                        try:
+                            if owner_id:
+                                bot.send_message(owner_id, f"❌ Aborting: too many sequential failures (question index {idx}).")
+                        except Exception:
+                            logger.exception("Failed to notify owner about abort.")
+                        return sent_count
+                    # skip this question
                     continue
 
-                correct_idx = _correct_option_index(q)
-                question_text = q.get("raw_question") or q.get("question") or "Question"
+                # Prepare explanation (EXP)
+                explanation = item.get("exp") or None
 
-                logger.info("Posting poll to %s: %s", chat_id, question_text[:60])
-                # send_poll -> returns Message object
-                poll_message = _send_with_retries(
-                    bot,
-                    "send_poll",
-                    max_retries=max_retries,
-                    chat_id=chat_id,
-                    question=question_text,
-                    options=options,
-                    is_anonymous=bool(anonymous),
-                    type="quiz",
-                    correct_option_id=int(correct_idx),
-                    disable_notification=False,
-                )
-
-                questions_sent += 1
-                consecutive_failures = 0
-
-                # If EXP present, send as follow-up message (reply to poll) so explanation is available.
-                exp_text = q.get("exp")
-                if exp_text:
+                # Try sending poll with retries and handling RetryAfter
+                attempt = 0
+                while attempt < max_retries:
                     try:
-                        reply_to = None
-                        # poll_message may be None or a Message; try to get message_id to reply to
-                        if hasattr(poll_message, "message_id"):
-                            reply_to = getattr(poll_message, "message_id")
-                        _send_with_retries(
-                            bot,
-                            "send_message",
-                            max_retries=max_retries,
+                        # send_poll uses correct_option_id index
+                        # python-telegram-bot 13's send_poll may accept 'explanation' param via Bot API though PTB v13 sometimes
+                        # We'll call bot.send_poll and include explanation if API supports it. If not supported, fallback to sending separate msg.
+                        poll = bot.send_poll(
                             chat_id=chat_id,
-                            text=f"💡 Explanation: {exp_text}",
-                            reply_to_message_id=reply_to,
+                            question=qtext,
+                            options=option_texts,
+                            is_anonymous=is_anonymous,
+                            type="quiz",
+                            correct_option_id=correct_index,
+                            explanation=explanation if explanation else None
                         )
-                    except Exception:
-                        logger.exception("Failed to send EXP follow-up for question %s", question_text[:40])
-
-                # apply delay rule
-                if total_questions <= 50:
-                    time.sleep(poll_delay_short)
+                        sent_count += 1
+                        consecutive_failures = 0
+                        # after posting poll, sleep appropriate delay
+                        # small heuristics: if many questions, use long delay
+                        if len(sequence) <= 50:
+                            time.sleep(poll_delay_short)
+                        else:
+                            time.sleep(poll_delay_long)
+                        break  # success -> leave retry loop
+                    except RetryAfter as ra:
+                        # if API asks to wait, honor it
+                        wait = getattr(ra, "retry_after", None) or 1
+                        logger.warning("RetryAfter(%s) for question index %s — sleeping %s s", ra, idx, wait)
+                        time.sleep(wait)
+                        attempt += 1
+                        continue
+                    except TelegramError as te:
+                        # network / api errors; retry with backoff
+                        attempt += 1
+                        backoff = min(2 ** attempt, 30)
+                        logger.exception("TelegramError posting question idx %s attempt %s: %s, retrying in %s s", idx, attempt, te, backoff)
+                        time.sleep(backoff)
+                        continue
+                    except Exception as exc:
+                        attempt += 1
+                        backoff = min(2 ** attempt, 30)
+                        logger.exception("Unexpected error posting question idx %s attempt %s: %s", idx, attempt, exc)
+                        time.sleep(backoff)
+                        continue
                 else:
-                    time.sleep(poll_delay_long)
+                    # exhausted retries for this question
+                    consecutive_failures += 1
+                    logger.error("Exhausted retries for question index %s. Skipping.", idx)
+                    if owner_id:
+                        try:
+                            bot.send_message(owner_id, f"❌ Failed to post question #{idx}. Aborting job.")
+                        except Exception:
+                            logger.exception("Failed to notify owner about question failure.")
+                    if consecutive_failures >= sequential_fail_abort:
+                        if owner_id:
+                            try:
+                                bot.send_message(owner_id, f"❌ Aborted job due to repeated failures at question #{idx}.")
+                            except Exception:
+                                logger.exception("Failed to notify owner on abort.")
+                        return sent_count
+                    continue
+
+            else:
+                logger.warning("Unknown sequence item at index %s: %s", idx, item)
                 continue
 
-            # unknown item type -> log and continue
-            logger.warning("Unknown sequence item (skipped): %s", item)
-        except Exception as e:
-            logger.exception("Failed to post sequence item at index %s: %s", idx, e)
+        except Exception:
+            logger.exception("Unhandled exception while processing sequence index %s", idx)
             consecutive_failures += 1
             if consecutive_failures >= sequential_fail_abort:
-                logger.error("Consecutive failures >= %s ; aborting job", sequential_fail_abort)
-                # notify owner
                 if owner_id:
                     try:
-                        bot.send_message(owner_id, f"❌ Multiple failures detected. Aborting quiz job for {chat_name or chat_id}.")
+                        bot.send_message(owner_id, f"❌ Aborted job due to repeated unhandled exceptions at index {idx}.")
                     except Exception:
-                        logger.exception("Failed to notify owner after abort")
-                return False
-            # small backoff before continuing
-            time.sleep(min(2 ** consecutive_failures, 30))
+                        logger.exception("Failed to notify owner on abort.")
+                return sent_count
+            continue
 
-    # finished all items
-    if owner_id:
-        try:
-            bot.send_message(owner_id, f"✅ {questions_sent} quiz(es) sent successfully to {chat_name or chat_id} 🎉")
-        except Exception:
-            logger.exception("Failed to notify owner on success.")
-    return True
+    # job done — final single confirmation (idempotent)
+    try:
+        notified = False
+        # try DB-level idempotency if available
+        if job_id:
+            try:
+                # db.mark_job_done should return True if it marked now, False if already marked earlier.
+                if hasattr(db, "mark_job_done"):
+                    notified = not db.mark_job_done(job_id)  # mark_job_done returns False if already done, True if newly marked
+                    # We want notified == False to mean NOT notified yet. So invert logic.
+                    # If db.mark_job_done returns True (newly marked) -> we should notify now (so notified False)
+                    # If returns False (already done) -> notified True (so skip)
+                    notified = False if db.mark_job_done(job_id) else True
+                else:
+                    notified = False
+            except Exception:
+                logger.exception("db.mark_job_done() failed; falling back to in-memory guard.")
+                notified = False
+
+        # in-memory fallback guard
+        if not notified:
+            if job_id:
+                key = job_id
+            else:
+                key = f"{chat_id}:{owner_id}:{sent_count}"
+            if key in _notified_jobs:
+                notified = True
+            else:
+                _notified_jobs.add(key)
+                notified = False
+
+        if not notified and owner_id:
+            name = chat_name if chat_name else str(chat_id)
+            bot.send_message(owner_id, f"✅ {sent_count} quiz(es) sent successfully to {name} 🎉")
+    except Exception:
+        logger.exception("Failed to send final owner confirmation.")
+
+    return sent_count
