@@ -1,160 +1,182 @@
 # validator.py
 import re
-from typing import Dict, Any, List, Optional
+from typing import List, Dict, Any, Tuple
 
-Q_RE = re.compile(r'^\s*Q\s*:\s*(.+)', re.IGNORECASE)
-OPT_RE = re.compile(r'^\s*([A-L])\s*:\s*(.+)', re.IGNORECASE)  # allow A-L, but A-D are required
-ANS_RE = re.compile(r'^\s*ANS\s*:\s*([A-L])\s*$', re.IGNORECASE)
-EXP_RE = re.compile(r'^\s*EXP\s*:\s*(.+)', re.IGNORECASE)
-DES_RE = re.compile(r'^\s*DES\s*:\s*(.+)', re.IGNORECASE)
-EG_RE = re.compile(r'^\s*Eg\(', re.IGNORECASE)
+EG_PATTERN = re.compile(r'^\s*Eg\(', re.IGNORECASE)
+DES_PATTERN = re.compile(r'^\s*DES\s*:\s*(.*)', re.IGNORECASE)
+Q_PATTERN = re.compile(r'^\s*Q\s*:\s*(.*)', re.IGNORECASE)
+OPT_PATTERN = re.compile(r'^\s*([A-Z])\s*:\s*(.*)')  # A: text
+ANS_PATTERN = re.compile(r'^\s*ANS\s*:\s*([A-Z])\s*$', re.IGNORECASE)
+EXP_PATTERN = re.compile(r'^\s*EXP\s*:\s*(.*)', re.IGNORECASE)
+
+def _strip_trailing_colon_text(s: str) -> str:
+    return s.strip()
 
 def validate_and_parse(text: str) -> Dict[str, Any]:
     """
-    Very permissive parser per your rules:
-    1) DES allowed anywhere but not inside a Q block (we error if found inside)
-    2) Eg(...) lines ignored
-    3) Q must have at least A-D
-    4) ANS must be one of provided options
+    Very simple validator/parser following the rules:
+    1) DES allowed anywhere (but not inside a question block); record its position relative to Q blocks.
+    2) Ignore any line starting with Eg(
+    3) Q blocks must have at least A-D
+    4) ANS must be one of present options
     5) EXP optional
-    6) No strict checking of text content inside blocks
-    Returns:
-    {
-      "ok": bool,
-      "errors": [...],
-      "warnings": [...],
-      "des": str|None,
-      "des_pos": "before"|"after"|None,
-      "questions": [ { "raw_question": str, "options": {"A":...}, "ans": "A", "exp": str|None }, ... ]
-    }
+    6) Keep checks minimal - no heavy validation of option contents
     """
     lines = text.splitlines()
-    # strip and remove Eg(...) lines
-    filtered = []
-    for ln in lines:
-        if EG_RE.search(ln):
-            continue
-        filtered.append(ln.rstrip())
-
-    lines = filtered
-
     errors: List[str] = []
     warnings: List[str] = []
-    des_lines = []  # tuples (line_no, text)
-    qblocks = []
-    current = None
-    line_no = 0
+    des_entries: List[Dict[str, Any]] = []
+    questions: List[Dict[str, Any]] = []
 
-    for ln in lines:
-        line_no += 1
-        if not ln.strip():
-            continue
+    current_q = None
+    current_opts = {}
+    current_ans = None
+    current_exp = None
+    last_des_text = None
+    last_was_des = False
 
-        m = DES_RE.match(ln)
-        if m:
-            des_lines.append((line_no, m.group(1).strip()))
-            continue
-
-        m = Q_RE.match(ln)
-        if m:
-            # start new question block
-            if current:
-                qblocks.append(current)
-            current = {
-                "start_line": line_no,
-                "raw_question": m.group(1).strip(),
-                "options": {},
-                "ans": None,
-                "exp": None,
-                "lines": [ln]
-            }
-            continue
-
-        if current is None:
-            # text outside Q and DES ignored
-            continue
-
-        # inside a question block
-        m = OPT_RE.match(ln)
-        if m:
-            label = m.group(1).upper()
-            txt = m.group(2).strip()
-            # warn if duplicate
-            if label in current["options"]:
-                warnings.append(f"⚠️ Duplicate option {label} in Question starting line {current['start_line']}. Overwriting.")
-            current["options"][label] = txt
-            continue
-
-        m = ANS_RE.match(ln)
-        if m:
-            current["ans"] = m.group(1).upper()
-            continue
-
-        m = EXP_RE.match(ln)
-        if m:
-            current["exp"] = m.group(1).strip()
-            continue
-
-        # treat as continuation: attach to last option if exists else to question
-        if current:
-            if current["options"]:
-                # append to last option (sorted by label order)
-                last_label = sorted(current["options"].keys())[-1]
-                current["options"][last_label] = current["options"][last_label] + " " + ln.strip()
-            else:
-                current["raw_question"] = current["raw_question"] + " " + ln.strip()
-            continue
-
-    if current:
-        qblocks.append(current)
-
-    # detect DES position:
-    des: Optional[str] = None
-    des_pos: Optional[str] = None
-    if des_lines:
-        first_des_line, first_des_text = des_lines[0]
-        last_des_line, last_des_text = des_lines[-1]
-        first_q_line = qblocks[0]["start_line"] if qblocks else float('inf')
-        last_q_line = qblocks[-1]["start_line"] if qblocks else -1
-        if first_des_line < first_q_line:
-            des = first_des_text
-            des_pos = "before"
-        elif last_des_line > last_q_line:
-            des = last_des_text
-            des_pos = "after"
+    def finalize_question():
+        nonlocal current_q, current_opts, current_ans, current_exp
+        if current_q is None:
+            return
+        # minimal checks
+        missing_opts = [o for o in ("A", "B", "C", "D") if o not in current_opts]
+        if missing_opts:
+            errors.append(f"⚠️ Question {len(questions)+1} missing options: {', '.join(missing_opts)}")
+        if not current_ans:
+            errors.append(f"⚠️ Missing ANS in Question {len(questions)+1}")
         else:
-            # DES found inside/question area -> error
-            errors.append(f"⚠️ DES found inside question block (line {first_des_line})")
-            des = first_des_text
-            des_pos = None
-
-    parsed_questions = []
-    q_index = 0
-    for q in qblocks:
-        q_index += 1
-        opts = q["options"]
-        # require A-D
-        for label in ("A","B","C","D"):
-            if label not in opts:
-                errors.append(f"⚠️ Question {q_index} missing option {label}")
-        if not q["ans"]:
-            errors.append(f"⚠️ Missing ANS in Question {q_index}")
-        else:
-            if q["ans"] not in opts:
-                errors.append(f"⚠️ ANS \"{q['ans']}\" does not match options in Question {q_index}")
-        parsed_questions.append({
-            "raw_question": q["raw_question"],
-            "options": opts,
-            "ans": q["ans"],
-            "exp": q.get("exp")
+            if current_ans not in current_opts:
+                errors.append(f'⚠️ ANS "{current_ans}" does not match any option in Question {len(questions)+1}')
+        questions.append({
+            "raw_question": current_q,
+            "options": dict(current_opts),
+            "ans": current_ans,
+            "exp": current_exp
         })
+        current_q = None
+        current_opts = {}
+        current_ans = None
+        current_exp = None
 
-    ok = (len(errors) == 0)
+    # We'll track DES positions relative to question index.
+    # If a DES appears and there's no current question started yet, it's a "before question 0" (global before)
+    # If DES appears immediately before a Q line -> mark as before that question index.
+    # If DES appears after finishing a question and before next Q -> mark as after that question index.
+
+    q_index = 0
+    des_buffer = []  # track DES texts until assigned
+    in_question_block = False
+
+    for lineno, raw in enumerate(lines, start=1):
+        line = raw.rstrip("\n")
+        if not line.strip():
+            continue
+        if EG_PATTERN.match(line):
+            # ignore anything starting with Eg(
+            continue
+        m_des = DES_PATTERN.match(line)
+        if m_des:
+            txt = m_des.group(1).strip()
+            # record raw DES with lineno, we'll assign position later
+            des_buffer.append((lineno, txt))
+            last_was_des = True
+            continue
+
+        m_q = Q_PATTERN.match(line)
+        if m_q:
+            # If there was an open question, finalize it before starting new
+            if current_q is not None:
+                # finalize previous question
+                finalize_question()
+                q_index += 1
+
+            # assign any DESs that are in des_buffer to be "before" this new question
+            for (dline, dtext) in des_buffer:
+                des_entries.append({
+                    "lineno": dline,
+                    "text": dtext,
+                    "pos": "before",
+                    "q_index": len(questions)  # this question will be next
+                })
+            des_buffer = []
+            current_q = m_q.group(1).strip()
+            in_question_block = True
+            last_was_des = False
+            continue
+
+        m_opt = OPT_PATTERN.match(line)
+        if m_opt and in_question_block:
+            label = m_opt.group(1).strip().upper()
+            val = m_opt.group(2).strip()
+            # Accept forms like "(A) text" or "A) text" inside val — do not over-normalize, keep as-is.
+            # If duplicate label, warn + overwrite
+            if label in current_opts:
+                warnings.append(f"⚠️ Duplicate option {label} in Question {len(questions)+1} (line {lineno}). Overwriting.")
+            current_opts[label] = val
+            continue
+
+        m_ans = ANS_PATTERN.match(line)
+        if m_ans and in_question_block:
+            current_ans = m_ans.group(1).strip().upper()
+            continue
+
+        m_exp = EXP_PATTERN.match(line)
+        if m_exp and in_question_block:
+            current_exp = m_exp.group(1).strip()
+            continue
+
+        # If we reached a DES-like line inside an open question block, that's invalid per your rule
+        if DES_PATTERN.match(line) and in_question_block:
+            errors.append(f"⚠️ DES found inside question block (Question {len(questions)+1}) at line {lineno}.")
+            continue
+
+        # If line doesn't match anything and we're not in a question, treat as stray text (could be extra DES-like)
+        # We'll ignore stray lines that aren't DES/Q/A/ANS/EXP/Eg
+        # But if in question and line is unrecognized, append to current question text (raw_question) to be lenient
+        if in_question_block and current_q is not None:
+            # append to question body for safety
+            current_q = current_q + " " + line.strip()
+            continue
+
+        # else ignore
+        continue
+
+    # finalize last question
+    if current_q is not None:
+        finalize_question()
+        q_index = len(questions)
+
+    # Any remaining des_buffer -> assign as "after last question" (pos: after, q_index = last index-1)
+    for (dline, dtext) in des_buffer:
+        # if there are questions, attach as after the last question; else attach as global before (q_index 0 with pos before)
+        if questions:
+            des_entries.append({
+                "lineno": dline,
+                "text": dtext,
+                "pos": "after",
+                "q_index": len(questions)-1
+            })
+        else:
+            des_entries.append({
+                "lineno": dline,
+                "text": dtext,
+                "pos": "before",
+                "q_index": 0
+            })
+
+    # Build combined des (all DES concatenated) for backward compatibility
+    combined_des = None
+    if des_entries:
+        combined_des = "\n".join([d["text"] for d in des_entries])
+
+    ok = len(errors) == 0
+
     return {
         "ok": ok,
         "errors": errors,
         "warnings": warnings,
-        "des": des,
-        "des_pos": des_pos,
-        "questions": parsed_questions
+        "des_entries": des_entries,
+        "des": combined_des,
+        "questions": questions
     }
