@@ -8,40 +8,59 @@ import sys
 from typing import Optional, List, Dict, Any
 
 from flask import Flask, jsonify
-from telegram import Bot, Update
+from telegram import Bot, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# local modules
+# local modules (assumed present in repo)
 import db
 import worker
 from validator import validate_and_parse  # your validator.py
 
-# Logging
+# ----- Logging -----
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("quizbot")
 
-# Config from env
+# ----- Config from env -----
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set. Exiting.")
     raise SystemExit("TELEGRAM_BOT_TOKEN required")
 
+# Primary owner (single id) - optional but recommended
 OWNER_TG_ID = os.environ.get("OWNER_TG_ID")
 try:
     OWNER_TG_ID = int(OWNER_TG_ID) if OWNER_TG_ID else None
 except Exception:
     OWNER_TG_ID = None
 
+# SUDO_USERS - comma separated list of ids (owner + admins)
+SUDO_USERS = []
+sudo_env = os.environ.get("SUDO_USERS") or os.environ.get("SUDO_USERS_LIST")
+if sudo_env:
+    for part in sudo_env.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            SUDO_USERS.append(int(part))
+        except Exception:
+            logger.warning("Skipping invalid SUDO_USERS entry: %s", part)
+
+# If OWNER_TG_ID present but SUDO_USERS empty, add owner
+if OWNER_TG_ID and OWNER_TG_ID not in SUDO_USERS:
+    SUDO_USERS.insert(0, OWNER_TG_ID)
+
 REDIS_URL = os.environ.get("REDIS_URL")
 DB_PATH = os.environ.get("DB_PATH", "./quizbot.db")
+TARGET_CHAT_IDS = os.environ.get("TARGET_CHAT_IDS")  # optional CSV of default target chats
 
-# Initialize DB
+# ----- Initialize DB -----
 db.init_db()
 
-# Flask app for health (so Render can probe)
+# ----- Flask app for health -----
 app = Flask(__name__)
 
 @app.route("/")
@@ -50,135 +69,186 @@ def index():
 
 @app.route("/health")
 def health():
-    # we can check a simple meta key
     hb = db.get_meta("last_heartbeat") or ""
     return jsonify({"status": "ok", "last_heartbeat": hb}), 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     # Bind to 0.0.0.0 so Render routing works
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    try:
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    except Exception:
+        logger.exception("Flask failed")
 
-# Telegram bot initialization and handlers
+# ----- Helper functions -----
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 def is_owner(user_id: int) -> bool:
-    return OWNER_TG_ID is not None and int(user_id) == int(OWNER_TG_ID)
+    return user_id in SUDO_USERS
 
+def notify_owner(text: str):
+    if OWNER_TG_ID:
+        try:
+            bot.send_message(OWNER_TG_ID, text)
+        except Exception:
+            logger.exception("Failed to notify owner")
+
+# ----- Handlers -----
 def start_cmd(update: Update, context: CallbackContext):
     user = update.effective_user
+    if user is None:
+        return
     if is_owner(user.id):
-        # owner view
-        msg = "🛡️ BLACK RHINO CONTROL PANEL\nWelcome, Owner.\nSend formatted quiz text (DES/Q/A/ANS/EXP) and I will post it."
-        context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
+        msg = "🛡️ BLACK RHINO CONTROL PANEL\n\n🚀 Send a pre-formatted quiz message and I'll post it as polls."
+        # optional inline settings button
+        buttons = [
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
+        ]
+        try:
+            context.bot.send_message(chat_id=update.effective_chat.id, text=msg,
+                                     reply_markup=InlineKeyboardMarkup(buttons))
+        except Exception:
+            logger.exception("Failed to send owner start message")
     else:
-        # normal user view
-        context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text="🚫 This is a private bot. This bot is restricted and can be used only by the authorized owner.")
+        try:
+            context.bot.send_message(chat_id=update.effective_chat.id,
+                                     text="🚫 This is a private bot. This bot is restricted and can be used only by the authorized owner.")
+        except Exception:
+            logger.exception("Failed to send private notice")
 
 def help_cmd(update: Update, context: CallbackContext):
-    context.bot.send_message(chat_id=update.effective_chat.id,
-                             text="Send formatted quiz text (owner only).")
+    try:
+        context.bot.send_message(chat_id=update.effective_chat.id,
+                                 text="Send formatted quiz text (owner/sudo only).")
+    except Exception:
+        logger.exception("Failed to send help")
 
 def owner_only_message_handler(update: Update, context: CallbackContext):
     """
-    Accepts only messages from owner; validates format and enqueues posting.
+    Accepts messages (containing 'Q:') only from sudo users.
+    Validates, stores job and asks for target if needed, then queues posting in background thread.
     """
     if update.effective_user is None:
         return
     uid = update.effective_user.id
     if not is_owner(uid):
-        # ignore non-owner messages
-        logger.info("Ignored message from non-owner: %s", uid)
+        logger.info("Ignored message from non-sudo user: %s", uid)
         return
 
     text = update.effective_message.text or ""
-    # Validate
-    res = validate_and_parse(text)
-    if not res['ok']:
-        # send errors back to owner
+    # Validate with validator.py
+    try:
+        res = validate_and_parse(text)
+    except Exception:
+        logger.exception("Validator crashed")
+        context.bot.send_message(uid, "⚠️ Validator crashed. Check logs.")
+        return
+
+    if not res.get('ok'):
         errs = "\n".join(res.get('errors', []))
         warns = "\n".join(res.get('warnings', []))
-        reply = f"⚠️ Format errors:\n{errs}"
+        reply = f"⚠️ Format errors:\n{errs}" if errs else "⚠️ Format errors."
         if warns:
             reply += f"\n⚠️ Warnings:\n{warns}"
         context.bot.send_message(chat_id=uid, text=reply)
         return
 
-    # All good — prepare job
     title = res.get('des')
     questions_input = []
     for q in res["questions"]:
-        # build question dict for worker
-        # options must be listed in alphabetical order of labels
         labels = sorted(q["options"].keys())
         options = {lbl: q["options"][lbl] for lbl in labels}
         questions_input.append({
-            "raw_question": q["raw_question"],
+            "raw_question": q.get("raw_question"),
             "options": options,
-            "ans": q["ans"],
+            "ans": q.get("ans"),
             "exp": q.get("exp")
         })
 
-    # Request owner for target chat (simple behavior: if TARGET_CHAT_IDS env exists use first; else ask owner)
-    target_env = os.environ.get("TARGET_CHAT_IDS")
+    # Determine target chat:
     target_chat = None
-    if target_env:
-        # take first id
+    # First, if OWNER sent inline selection of chat id earlier - (not implemented complex mapping)
+    # Next, check TARGET_CHAT_IDS env
+    if TARGET_CHAT_IDS:
         try:
-            target_chat = int(target_env.split(",")[0].strip())
+            tgt = TARGET_CHAT_IDS.split(",")[0].strip()
+            target_chat = int(tgt)
         except Exception:
             target_chat = None
 
     if target_chat is None:
-        # ask owner which chat - but for simplicity, post back quick question to owner:
-        context.bot.send_message(uid, "Choose channel/group where you want to post this quiz 📨\n(Reply with chat id number or set TARGET_CHAT_IDS env)")
-        # store job payload temporarily in DB and wait for owner to respond: to keep code minimal, we ask owner to reply with chat id
-        db.save_job(job_id="pending:"+str(int(time.time())), payload=text, status="waiting_target")
+        # Ask owner to reply with chat id (simple flow)
+        context.bot.send_message(uid, "📨 Choose channel/group where you want to post this quiz. Reply with chat id (e.g. -1001234567890) or set TARGET_CHAT_IDS env.")
+        # Save the job in DB for later pick-up when owner replies with chat id
+        job_id = "pending:" + str(int(time.time()))
+        db.save_job(job_id=job_id, payload=text, status="waiting_target")
         return
 
-    # if target provided, create a background thread to run posting so main thread is not blocked
+    # enqueue posting but run in background thread (worker.post_quiz_questions handles delays/retries)
     def run_job():
         try:
-            success = worker.post_quiz_questions(context.bot, target_chat, title, questions_input, OWNER_TG_ID)
-            if not success:
-                logger.error("Job failed for target %s", target_chat)
-        except Exception:
-            logger.exception("Uncaught error in run_job thread")
+            ok = worker.post_quiz_questions(bot, target_chat, title, questions_input, uid)
+            if ok:
+                try:
+                    bot.send_message(uid, f"✅ {len(questions_input)} quiz questions posted successfully in {target_chat}.")
+                except Exception:
+                    logger.exception("Failed to send completion message")
+            else:
+                bot.send_message(uid, "⚠️ Posting job failed. Check logs.")
+        except Exception as e:
+            logger.exception("Uncaught error in run_job")
+            try:
+                bot.send_message(uid, f"❌ Job crashed: {e}")
+            except Exception:
+                logger.exception("Failed to notify owner about job crash")
 
     t = threading.Thread(target=run_job, daemon=True)
     t.start()
     context.bot.send_message(uid, f"✅ Job queued. Posting to chat {target_chat} shortly.")
 
-# Generic handler for replies to choose chat id if owner had pending job (very simple)
 def owner_text_general(update: Update, context: CallbackContext):
+    """
+    Simple handler to accept plain text replies from owner.
+    If owner replies with a numeric chat id and there's a pending job -> post it.
+    """
     if update.effective_user is None:
         return
     uid = update.effective_user.id
     if not is_owner(uid):
         return
     text = (update.effective_message.text or "").strip()
-    # crude: if text looks like an integer and pending job exists, use it as chat id
-    if text.isdigit():
-        # find a pending job
-        # For simplicity, pick the most recent waiting_target job
-        # This is a simple flow; you can expand to robust mapping later
-        # We'll just scan DB rows for job with status waiting_target
+    if not text:
+        return
+
+    # If text is digits (allow negative for supergroups)
+    is_chatid = False
+    try:
+        # support -100... ids
+        if text.startswith("-") and text[1:].isdigit():
+            is_chatid = True
+        elif text.isdigit():
+            is_chatid = True
+    except Exception:
+        is_chatid = False
+
+    if is_chatid:
+        # find a pending waiting_target job
         try:
             conn = db._get_conn()
             cur = conn.cursor()
             cur.execute("SELECT id, payload FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT 1", ("waiting_target",))
             row = cur.fetchone()
             if row:
+                job_id = row["id"]
                 job_payload = row["payload"]
-                # remove job or mark as queued
-                cur.execute("UPDATE jobs SET status = ? WHERE id = ?", ("queued", row["id"]))
+                # mark queued
+                cur.execute("UPDATE jobs SET status = ? WHERE id = ?", ("queued", job_id))
                 conn.commit()
                 conn.close()
-                # now validate payload and post
+                # validate and post
                 res = validate_and_parse(job_payload)
-                if not res['ok']:
-                    context.bot.send_message(uid, "Stored job content is no longer valid. Aborting.")
+                if not res.get('ok'):
+                    context.bot.send_message(uid, "Stored job content invalid. Aborting.")
                     return
                 title = res.get('des')
                 questions_input = []
@@ -186,78 +256,103 @@ def owner_text_general(update: Update, context: CallbackContext):
                     labels = sorted(q["options"].keys())
                     options = {lbl: q["options"][lbl] for lbl in labels}
                     questions_input.append({
-                        "raw_question": q["raw_question"],
+                        "raw_question": q.get("raw_question"),
                         "options": options,
-                        "ans": q["ans"],
+                        "ans": q.get("ans"),
                         "exp": q.get("exp")
                     })
                 target_chat = int(text)
+
                 def run_job():
-                    worker.post_quiz_questions(context.bot, target_chat, title, questions_input, OWNER_TG_ID)
+                    try:
+                        ok = worker.post_quiz_questions(bot, target_chat, title, questions_input, uid)
+                        if ok:
+                            bot.send_message(uid, f"✅ {len(questions_input)} quiz questions posted successfully in {target_chat}.")
+                        else:
+                            bot.send_message(uid, "⚠️ Posting job failed. Check logs.")
+                    except Exception:
+                        logger.exception("run_job error")
+                        try:
+                            bot.send_message(uid, "❌ Job crashed during posting.")
+                        except Exception:
+                            pass
+
                 threading.Thread(target=run_job, daemon=True).start()
                 context.bot.send_message(uid, f"✅ Job queued and will be posted to {target_chat}.")
+                return
+            else:
+                context.bot.send_message(uid, "No pending job found. Send formatted quiz first.")
                 return
         except Exception:
             logger.exception("Error processing pending job for owner-provided chat id.")
             context.bot.send_message(uid, "Error processing pending job. See logs.")
             return
 
-    # else treat it as a normal message — help text
-    context.bot.send_message(uid, "To post a saved job reply with chat id number (e.g. -1001234567890).")
+    # fallback
+    context.bot.send_message(uid, "Reply with a chat id to post pending job (e.g. -1001234567890).")
 
-# resilience: start polling in a loop with reconnect attempts
-def start_polling_resilient(updater: Updater):
-    backoff = 1
-    while True:
-        try:
-            logger.info("Starting polling...")
-            updater.start_polling(poll_interval=1.0, timeout=20)
-            updater.idle()  # blocks until stop() is called
-            logger.info("Updater.idle() returned; exiting polling loop.")
-            break
-        except Exception as e:
-            logger.exception("Polling crashed: %s", e)
-            # notify owner
-            if OWNER_TG_ID:
-                try:
-                    bot.send_message(OWNER_TG_ID, f"⚠️ Bot polling crashed with error: {e}. Restarting in {backoff}s.")
-                except Exception:
-                    logger.exception("Failed to notify owner about crash.")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)  # cap backoff
+# ----- Polling resilience / main -----
+def heartbeat_worker():
+    """Update last_heartbeat every 30s so /health shows liveness."""
+    try:
+        while True:
+            ts = str(int(time.time()))
+            try:
+                db.set_meta("last_heartbeat", ts)
+            except Exception:
+                logger.exception("Failed to write heartbeat to DB")
+            time.sleep(30)
+    except Exception:
+        logger.exception("Heartbeat thread died")
 
 def main():
-    # run flask in separate thread for health
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    # Start Flask health in background
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Start heartbeat thread
+    hb_thread = threading.Thread(target=heartbeat_worker, daemon=True)
+    hb_thread.start()
 
     # Setup Updater and handlers
     updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
+
     dp.add_handler(CommandHandler("start", start_cmd))
     dp.add_handler(CommandHandler("help", help_cmd))
 
-    # For owner message handling: if message looks like formatted quiz (contains 'Q:'), go to owner handler
-    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=OWNER_TG_ID) & Filters.regex(r'Q:'), owner_only_message_handler))
-    # fallback owner text handler (for chat id replies)
-    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=OWNER_TG_ID), owner_text_general))
+    # Message handlers:
+    # Owner messages that contain 'Q:' -> main quiz handler
+    if OWNER_TG_ID:
+        user_filter_for_owner = Filters.user(user_id=SUDO_USERS)
+    else:
+        user_filter_for_owner = Filters.user(user_id=SUDO_USERS) if SUDO_USERS else Filters.user(user_id=[])
+    dp.add_handler(MessageHandler(Filters.text & user_filter_for_owner & Filters.regex(r'Q:'), owner_only_message_handler))
+    dp.add_handler(MessageHandler(Filters.text & user_filter_for_owner, owner_text_general))
 
-    # Start resilient polling loop in a thread so main can manage signals
-    poll_thread = threading.Thread(target=start_polling_resilient, args=(updater,), daemon=True)
-    poll_thread.start()
-
-    # heartbeat: update DB meta every 30s so health can show last heartbeat
-    try:
-        while True:
-            ts = str(int(time.time()))
-            db.set_meta("last_heartbeat", ts)
-            time.sleep(30)
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received; shutting down.")
-        updater.stop()
-    except Exception:
-        logger.exception("Main loop exception; exiting.")
-        updater.stop()
+    # Start polling in MAIN THREAD (this is important)
+    backoff = 1
+    while True:
+        try:
+            logger.info("Starting polling (main thread)...")
+            updater.start_polling(poll_interval=1.0, timeout=20)
+            # idle() will block here in main thread and handle signals correctly
+            updater.idle()
+            logger.info("Updater.idle() returned; exiting.")
+            break
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt — shutting down")
+            try:
+                updater.stop()
+            except Exception:
+                pass
+            break
+        except Exception as e:
+            logger.exception("Polling crashed: %s", e)
+            notify_owner(f"⚠️ Bot polling crashed with error: {e}. Restarting in {backoff}s.")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            # try again (loop)
 
 if __name__ == "__main__":
     main()
