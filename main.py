@@ -3,68 +3,68 @@ import os
 import logging
 import threading
 import time
+import json
 import uuid
-from typing import Dict, Optional
+import sqlite3
+from typing import Optional, Tuple, List, Dict, Any
 
 from flask import Flask, jsonify
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
 
 import db
-from validator import validate_and_parse
 import worker
+from validator import validate_and_parse
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger("quizbot")
 
-# ENV / config
+# Config from env
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set. Exiting.")
     raise SystemExit("TELEGRAM_BOT_TOKEN required")
 
-# Parse SUDO_USERS (CSV of ids)
-SUDO_RAW = os.environ.get("SUDO_USERS", "")
-SUDO_USERS = set()
-for part in (SUDO_RAW.split(",") if SUDO_RAW else []):
-    p = part.strip()
-    if not p:
-        continue
-    try:
-        SUDO_USERS.add(int(p))
-    except Exception:
-        logger.warning("Ignoring non-integer SUDO_USERS value: %s", p)
-
-# Parse TARGET_CHATS in Name:chatid,Name2:chatid2 form
-TARGET_RAW = os.environ.get("TARGET_CHATS", "")
-TARGET_CHATS: Dict[str, int] = {}
-if TARGET_RAW:
-    for item in TARGET_RAW.split(","):
-        item = item.strip()
-        if not item:
+# SUDO_USERS: CSV of ints
+def get_sudo_users() -> List[int]:
+    s = os.environ.get("SUDO_USERS", "")
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
             continue
-        if ":" in item:
-            name, cid = item.split(":", 1)
-            name = name.strip()
-            try:
-                cid_val = int(cid.strip())
-            except Exception:
-                logger.warning("Invalid chat id for target '%s' -> '%s'", name, cid)
-                continue
-            TARGET_CHATS[name] = cid_val
-        else:
-            # fallback: unnamed chat id
-            try:
-                cid_val = int(item)
-                TARGET_CHATS[item] = cid_val
-            except Exception:
-                logger.warning("Invalid TARGET_CHATS entry: %s", item)
+        try:
+            out.append(int(part))
+        except Exception:
+            continue
+    return out
 
-# Start DB
-db.init_db()
+SUDO_USERS = get_sudo_users()
 
-# Flask app for health
+OWNER_TG_ID = None
+owner_env = os.environ.get("OWNER_TG_ID")
+if owner_env:
+    try:
+        OWNER_TG_ID = int(owner_env)
+        if OWNER_TG_ID not in SUDO_USERS:
+            SUDO_USERS.append(OWNER_TG_ID)
+    except Exception:
+        pass
+
+def is_owner(user_id: int) -> bool:
+    try:
+        return int(user_id) in SUDO_USERS
+    except Exception:
+        return False
+
+# initialize DB
+DB_PATH = os.environ.get("DB_PATH", "./quizbot.db")
+db.init_db(DB_PATH)
+
+# Flask app for health checks
 app = Flask(__name__)
 
 @app.route("/")
@@ -80,255 +80,230 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# helper
-def is_owner(user_id: int) -> bool:
-    return int(user_id) in SUDO_USERS
-
+# Bot init
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-# /start handler
+# Helper for TARGET_CHATS env
+def get_target_chats_from_env() -> List[Tuple[str,int]]:
+    # Format: Name1:chatid1,Name2:chatid2
+    val = os.environ.get("TARGET_CHATS", "")
+    pairs = []
+    for part in val.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            name, cid = part.split(":", 1)
+            try:
+                cid_val = int(cid.strip())
+                pairs.append((name.strip(), cid_val))
+            except Exception:
+                continue
+    return pairs
+
+# Handlers
 def start_cmd(update: Update, context: CallbackContext):
     user = update.effective_user
-    if not user:
-        return
-    uid = user.id
-    if is_owner(uid):
+    if user and is_owner(user.id):
         msg = "🛡️ BLACK RHINO CONTROL PANEL\n🚀 Send a pre-formatted quiz message and I'll post it as polls."
         context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
     else:
         context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text="🚫 This is a private bot. This bot is restricted and can be used only by the authorized owner.")
+                                 text="🚫 This is a private bot. This bot is restricted and can be used only by authorized owners.")
 
 def help_cmd(update: Update, context: CallbackContext):
-    context.bot.send_message(chat_id=update.effective_chat.id, text="Send formatted quiz text (owner only).")
+    context.bot.send_message(chat_id=update.effective_chat.id,
+                             text="Send the quiz in the format (DES/Q/A/B/C/D/ANS/EXP). Only SUDO_USERS can post.")
 
-# When owner sends formatted quiz text
-def owner_message_handler(update: Update, context: CallbackContext):
-    user = update.effective_user
-    if not user:
+# Owner message -> validate -> ask poll type
+def owner_only_message_handler(update: Update, context: CallbackContext):
+    if update.effective_user is None:
         return
-    uid = user.id
+    uid = update.effective_user.id
     if not is_owner(uid):
         logger.info("Ignored message from non-owner: %s", uid)
         return
 
     text = update.effective_message.text or ""
-    # quick heuristic: must contain 'Q:' to be considered quiz
-    if "Q:" not in text:
-        context.bot.send_message(uid, "I expected a formatted quiz input containing 'Q:'.")
-        return
-
     res = validate_and_parse(text)
-    if not res['ok']:
-        errs = "\n".join(res.get('errors', []))
-        warns = "\n".join(res.get('warnings', []))
-        reply = f"⚠️ Format errors:\n{errs}"
+    if not res.get('ok', False):
+        errs = res.get('errors', [])
+        warns = res.get('warnings', [])
+        reply = "⚠️ Format errors:\n" + ("\n".join(errs) if errs else "Unknown format error.")
         if warns:
-            reply += f"\n⚠️ Warnings:\n{warns}"
+            reply += "\n⚠️ Warnings:\n" + ("\n".join(warns))
         context.bot.send_message(chat_id=uid, text=reply)
         return
 
-    # Save job in DB
-    job_id = f"job:{uuid.uuid4().hex}"
-    db.save_job(job_id, text, owner_id=uid, status="waiting_target")
+    job_id = str(uuid.uuid4())
+    payload = {"id": job_id, "text": text, "parsed": res}
+    try:
+        db.save_job(job_id=job_id, payload=json.dumps(payload), status="await_poll_type", owner_id=uid)
+    except Exception:
+        logger.exception("Failed to save job to DB.")
+        context.bot.send_message(chat_id=uid, text="⚠️ Failed to save job. Try again.")
+        return
 
-    # Build inline keyboard from TARGET_CHATS
-    if not TARGET_CHATS:
-        context.bot.send_message(uid, "⚠️ No TARGET_CHATS configured. Set TARGET_CHATS env (Name:chatid,...).")
+    keyboard = [
+        [InlineKeyboardButton("🔒 Anonymous", callback_data=f"polltype|{job_id}|anon"),
+         InlineKeyboardButton("🌍 Public", callback_data=f"polltype|{job_id}|public")]
+    ]
+    context.bot.send_message(chat_id=uid, text="Choose poll type:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# Callback: poll type selected
+def callback_poll_type(update: Update, context: CallbackContext):
+    q = update.callback_query
+    q.answer()
+    try:
+        _, job_id, ptype = q.data.split("|")
+    except Exception:
+        q.edit_message_text("Invalid selection.")
+        return
+
+    job_row = db.get_job(job_id)
+    if not job_row:
+        q.edit_message_text("Job not found or expired.")
+        return
+
+    # store poll_type
+    extra = {"poll_type": ptype}
+    db.update_job_status(job_id, "await_target", extra=json.dumps(extra))
+
+    pairs = get_target_chats_from_env()
+    if not pairs:
+        q.edit_message_text("No TARGET_CHATS set. Reply with chat id to post, or set TARGET_CHATS env.")
         return
 
     keyboard = []
-    for name, cid in TARGET_CHATS.items():
-        # callback data encodes job id and target chat id
-        cb = f"post::{job_id}::{cid}"
-        keyboard.append([InlineKeyboardButton(text=name, callback_data=cb)])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    context.bot.send_message(uid, text="Choose channel/group where you want to post this quiz 📨", reply_markup=reply_markup)
+    for name, cid in pairs:
+        keyboard.append([InlineKeyboardButton(f"{name}", callback_data=f"target|{job_id}|{cid}")])
+    q.edit_message_text("Choose channel/group to post:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# Callback when owner selects target chat
-def callback_post_to_target(update: Update, context: CallbackContext):
-    query = update.callback_query
-    if not query:
-        return
-    uid = query.from_user.id
-    data = query.data or ""
-    # parse callback_data
-    if not data.startswith("post::"):
-        query.answer()
-        return
-    _, job_id, cid = data.split("::", 2)
+# Callback: target selected
+def callback_target_selected(update: Update, context: CallbackContext):
+    q = update.callback_query
+    q.answer()
     try:
-        cid_val = int(cid)
+        _, job_id, cid_str = q.data.split("|")
+        cid = int(cid_str)
     except Exception:
-        query.answer(text="Invalid chat id", show_alert=True)
+        q.edit_message_text("Invalid target selection.")
         return
 
-    # verify owner
-    if not is_owner(uid):
-        query.answer(text="Unauthorized", show_alert=True)
+    job_row = db.get_job(job_id)
+    if not job_row:
+        q.edit_message_text("Job missing/expired.")
         return
 
-    # fetch job
-    job = db.get_job(job_id)
-    if not job or job.get("status") != "waiting_target":
-        query.answer(text="This job is no longer available.", show_alert=True)
-        return
+    payload = json.loads(job_row['payload'])
+    parsed = payload["parsed"]
+    extra = json.loads(job_row.get("extra") or "{}")
+    poll_type = extra.get("poll_type", "public")
+    is_anon = (poll_type == "anon")
 
-    payload = job.get("payload")
-    # mark as queued
-    db.mark_job_status(job_id, "queued")
-    query.answer(text="Queued. Posting will start shortly.", show_alert=False)
+    db.update_job_status(job_id, "queued")
+    owner_id = job_row.get("owner_id")
 
-    # parse payload again
-    res = validate_and_parse(payload)
-    if not res['ok']:
-        # report back
-        try:
-            context.bot.send_message(uid, "Stored job is no longer valid. Aborting.")
-        except Exception:
-            logger.exception("Failed to notify owner.")
-        db.mark_job_status(job_id, "failed")
-        return
-
-    title = res.get('des')
-    questions_input = []
-    for q in res["questions"]:
-        labels = sorted(q["options"].keys())
-        options = {lbl: q["options"][lbl] for lbl in labels}
-        questions_input.append({
-            "raw_question": q["raw_question"],
-            "options": options,
-            "ans": q["ans"],
-            "exp": q.get("exp")
-        })
-
-    # run posting in background thread
+    # Start posting in background thread
     def run_job():
         try:
-            ok = worker.post_quiz_questions(context.bot, cid_val, title, questions_input, owner_id=uid)
-            if ok:
-                # Mark job done
-                db.mark_job_status(job_id, "done")
-            else:
-                db.mark_job_status(job_id, "aborted")
+            ok = worker.post_quiz_questions_background(bot, cid, parsed, is_anon, owner_id=owner_id)
+            db.update_job_status(job_id, "done" if ok else "failed")
         except Exception:
-            logger.exception("Uncaught error in job execution.")
-            db.mark_job_status(job_id, "failed")
+            logger.exception("Uncaught exception in job thread")
+            db.update_job_status(job_id, "failed")
 
     threading.Thread(target=run_job, daemon=True).start()
-    # send immediate confirmation to owner
-    # find friendly name for cid_val
-    target_name = None
-    for n, c in TARGET_CHATS.items():
-        if c == cid_val:
-            target_name = n
-            break
-    target_label = target_name if target_name else str(cid_val)
-    context.bot.send_message(uid, f"✅ Job queued. Posting to {target_label} now.")
+    q.edit_message_text("✅ Job queued. Posting will start now.")
 
-# General text handler (owner replies w/ chat id numeric) - kept for compatibility
+# Fallback: owner replies with chat id (when TARGET_CHATS not present)
 def owner_text_general(update: Update, context: CallbackContext):
-    user = update.effective_user
-    if not user:
+    if update.effective_user is None:
         return
-    uid = user.id
+    uid = update.effective_user.id
     if not is_owner(uid):
         return
-    txt = (update.effective_message.text or "").strip()
-    if txt.isdigit() or (txt.startswith("-") and txt[1:].isdigit()):
-        # pick most recent waiting job for this owner
-        job = db.fetch_most_recent_waiting(owner_id=uid)
-        if not job:
-            context.bot.send_message(uid, "No pending job found.")
+    text = (update.effective_message.text or "").strip()
+    if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+        # find latest awaiting job for this owner
+        job_row = db.get_latest_job_for_owner(uid, status="await_target")
+        if not job_row:
+            context.bot.send_message(uid, "No pending job found. Send formatted quiz text first.")
             return
-        job_id = job["id"]
-        payload = job["payload"]
-        db.mark_job_status(job_id, "queued")
-        res = validate_and_parse(payload)
-        if not res['ok']:
-            context.bot.send_message(uid, "Stored job invalid. Aborting.")
-            db.mark_job_status(job_id, "failed")
+        try:
+            cid = int(text)
+        except Exception:
+            context.bot.send_message(uid, "Invalid chat id.")
             return
-        title = res.get('des')
-        questions_input = []
-        for q in res["questions"]:
-            labels = sorted(q["options"].keys())
-            options = {lbl: q["options"][lbl] for lbl in labels}
-            questions_input.append({
-                "raw_question": q["raw_question"],
-                "options": options,
-                "ans": q["ans"],
-                "exp": q.get("exp")
-            })
-        target_chat = int(txt)
+
+        payload = json.loads(job_row["payload"])
+        parsed = payload["parsed"]
+        db.update_job_status(job_row["id"], "queued")
         def run_job():
-            try:
-                ok = worker.post_quiz_questions(context.bot, target_chat, title, questions_input, owner_id=uid)
-                if ok:
-                    db.mark_job_status(job_id, "done")
-                else:
-                    db.mark_job_status(job_id, "aborted")
-            except Exception:
-                logger.exception("run_job error")
-                db.mark_job_status(job_id, "failed")
+            worker.post_quiz_questions_background(bot, cid, parsed, is_anon=False, owner_id=uid)
+            db.update_job_status(job_row["id"], "done")
         threading.Thread(target=run_job, daemon=True).start()
-        context.bot.send_message(uid, f"✅ Job queued. Posting to {target_chat} now.")
+        context.bot.send_message(uid, f"✅ Job queued. Posting to {cid} shortly.")
         return
 
-    # fallback help
-    context.bot.send_message(uid, "Reply with chat id number to post latest saved job (e.g. -1001234567890).")
+    context.bot.send_message(uid, "Reply with chat id number to post a saved job (e.g. -1001234567890).")
 
-# Polling start/resilience (no updater.idle() to avoid signal-in-thread issues)
-def start_polling_loop(updater: Updater):
+# Resilient polling start (no idle in background threads)
+def start_polling_resilient(updater: Updater):
     backoff = 1
     while True:
         try:
-            logger.info("Starting updater.start_polling()")
-            updater.start_polling(poll_interval=1.0, timeout=20)
-            # Now run until an exception occurs (we keep main thread alive in main loop)
-            return  # we started polling successfully; return to main thread
+            logger.info("Starting polling (resilient mode)...")
+            # start_polling is non-blocking
+            updater.start_polling(poll_interval=1.0, timeout=20, clean=True)
+            # keep thread alive; check periodically if updater is running
+            while True:
+                if not updater.running:
+                    raise RuntimeError("Updater stopped unexpectedly")
+                time.sleep(5)
         except Exception as e:
-            logger.exception("Start polling failed: %s", e)
-            # notify owners
-            for uid in SUDO_USERS:
+            logger.exception("Polling crashed: %s", e)
+            if SUDO_USERS:
                 try:
-                    bot.send_message(uid, f"⚠️ Bot failed to start polling: {e}. Restarting in {backoff}s.")
+                    bot.send_message(SUDO_USERS[0], f"⚠️ Bot polling crashed with error: {e}. Restarting in {backoff}s.")
                 except Exception:
-                    pass
+                    logger.exception("Failed to notify owner about crash.")
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
+            # attempt restart by continuing loop
 
 def main():
-    # run flask in background
+    # Start Flask in its own thread
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
+    # Setup Updater and handlers
     updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start_cmd))
     dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=SUDO_USERS) & Filters.regex(r'Q:'), owner_only_message_handler))
+    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=SUDO_USERS), owner_text_general))
 
-    # owner handlers
-    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=list(SUDO_USERS)), owner_message_handler))
-    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=list(SUDO_USERS)), owner_text_general))
+    dp.add_handler(CallbackQueryHandler(callback_poll_type, pattern=r'^polltype\|'))
+    dp.add_handler(CallbackQueryHandler(callback_target_selected, pattern=r'^target\|'))
 
-    # callback for inline buttons
-    dp.add_handler(CallbackQueryHandler(callback_post_to_target, pattern=r"^post::"))
+    # Start resilient polling in a dedicated thread (we avoid updater.idle())
+    poll_thread = threading.Thread(target=start_polling_resilient, args=(updater,), daemon=True)
+    poll_thread.start()
 
-    # Start polling (non-blocking in main thread)
-    start_polling_loop(updater)
-
-    # Heartbeat loop - maintian last_heartbeat in DB
+    # Heartbeat loop
     try:
         while True:
-            db.set_meta("last_heartbeat", str(int(time.time())))
+            ts = str(int(time.time()))
+            db.set_meta("last_heartbeat", ts)
             time.sleep(30)
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt - shutting down")
+        logger.info("KeyboardInterrupt; stopping updater.")
         updater.stop()
     except Exception:
-        logger.exception("Main loop exception")
+        logger.exception("Main loop exception; stopping updater.")
         updater.stop()
 
 if __name__ == "__main__":
