@@ -3,3 +3,4 @@ Flask==2.3.2
 redis==5.0.1
 rq==1.15.1
 requests==2.31.0
+urllib3==1.26.16
