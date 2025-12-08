@@ -2,249 +2,202 @@
 import re
 from typing import List, Dict, Any
 
-_DES_RE = re.compile(r'^\s*DES:\s*(.*)$', re.IGNORECASE)
-_Q_RE = re.compile(r'^\s*Q:\s*(.*)$', re.IGNORECASE)
-_OPT_RE = re.compile(r'^\s*([A-Z]):\s*(.*)$', re.IGNORECASE)
-_ANS_RE = re.compile(r'^\s*ANS:\s*([A-Z])\s*$', re.IGNORECASE)
-_EXP_RE = re.compile(r'^\s*EXP:\s*(.*)$', re.IGNORECASE)
-_EG_RE = re.compile(r'(^|\s)Eg\(', re.IGNORECASE)  # contains Eg( -> ignore line
-
-def validate_and_parse(text: str) -> Dict[str, Any]:
+def validate_and_parse(raw_text: str) -> Dict[str, Any]:
     """
-    Parse incoming formatted quiz text.
+    Parse a text payload into:
+    {
+      "ok": bool,
+      "errors": [...],
+      "warnings": [...],
+      "des_list": [ {"pos": int, "text": str, "line": int}, ... ],
+      "des": first_des_text_or_none,
+      "questions": [
+         {"raw_question": "Q text", "options": {"A": "...","B":"...","C":"...","D":"..."}, "ans":"A", "exp":"..."},
+         ...
+      ]
+    }
 
-    Rules (minimal):
-      - Lines containing Eg( are ignored.
-      - DES: allowed anywhere except inside a question block.
-        Each DES is recorded and associated to the "next question index" (or after last if no next).
-      - Q: begins a question block.
-      - Options must include at least A,B,C,D each with some text.
-      - ANS: must be present and one of the option labels provided.
-      - EXP: optional, must appear after ANS within the same question block.
-    Returns:
-      {
-        "ok": bool,
-        "errors": [...],
-        "warnings": [...],
-        "des": first_des_or_None,
-        "des_list": [{"text": "...", "question_index": int, "line": lineno}, ...],
-        "questions": [
-            {"raw_question": "...", "options": {"A":"...","B":"...","C":"...","D":"..."}, "ans":"A", "exp":"..."},
-            ...
-        ]
-      }
+    Rules implemented (simple):
+    1) Lines starting with Eg( or containing Eg( are ignored completely.
+    2) DES: allowed anywhere but must NOT be inside a Q-block (between Q: and ANS:).
+       If found while parsing a question block -> it's an error.
+    3) Q: starts a question block.
+    4) A:, B:, C:, D: required (at least those four).
+    5) ANS: required and must match one of the present options.
+    6) EXP: optional (must appear after ANS).
+    7) Minimal normalization: option labels are standardized to single uppercase letters A..Z (strip spaces).
     """
-    lines = text.splitlines()
+
     errors: List[str] = []
     warnings: List[str] = []
+    questions: List[Dict[str, Any]] = []
     des_list: List[Dict[str, Any]] = []
 
-    questions: List[Dict[str, Any]] = []
+    lines = raw_text.splitlines()
+    # normalize lines trimming only trailing \r and spaces on right but keep left spaces not needed
+    # we'll operate on stripped left/right where appropriate
     in_q = False
-    current_q = None
-    line_no = 0
+    q = None
+    q_start_line = None
+    question_count = 0
 
-    for raw in lines:
-        line_no += 1
-        line = raw.rstrip("\n")
-        if not line.strip():
-            # blank lines are allowed, treat as separator
-            # but if we were inside a question and didn't see ANS, we keep waiting
+    # helper regex
+    re_label = re.compile(r'^([A-Za-z])\s*[:\)]\s*(.*)$')  # matches "A: text" or "A) text"
+    # iterate lines
+    for idx, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if line == "":
+            # blank lines separate blocks; if inside question, allow blank
             continue
 
-        # ignore Eg( anywhere in line
-        if _EG_RE.search(line):
+        # ignore Eg(...) anywhere
+        if "Eg(" in line or line.startswith("Eg(") or line.startswith("eg("):
             continue
 
-        m_des = _DES_RE.match(line)
-        if m_des:
-            des_text = m_des.group(1).strip()
+        # DES detection (must be line starting with DES:)
+        if line.upper().startswith("DES:"):
+            des_text = line[len("DES:"):].strip()
+            # If we're currently inside a question block between Q: and before end (ANS processed)
             if in_q:
-                # DES inside Q block -> error
-                errors.append(f"⚠️ DES found inside question block (Question {len(questions)+1}) at line {line_no}.")
+                # DES inside question block → error
+                errors.append(f"⚠️ DES found inside question block (Question {question_count+1}) at line {idx}.")
+                # still record, but keep it flagged; we won't stop parsing
+                des_list.append({"pos": question_count, "text": des_text, "line": idx})
             else:
-                # record DES to be sent before the next question: question_index = len(questions)
-                des_list.append({"text": des_text, "question_index": len(questions), "line": line_no})
+                # record DES positioned at current question_count (before next question)
+                des_list.append({"pos": question_count, "text": des_text, "line": idx})
             continue
 
-        m_q = _Q_RE.match(line)
-        if m_q:
-            # start a new question block
-            if in_q:
-                # previous question open but missing ANS => error
-                errors.append(f"⚠️ Missing ANS in Question {len(questions)+1} (line ~{line_no}).")
-                # finalize previous with what we have (but mark invalid)
-                # do not append incomplete question
+        # Question start
+        if line.startswith("Q:"):
+            # if previous question still open, finalize and validate
+            if in_q and q:
+                # finalize: check mandatory fields
+                missing = []
+                for label in ["A", "B", "C", "D"]:
+                    if label not in q["options"]:
+                        missing.append(label)
+                if missing:
+                    errors.append(f"⚠️ Question {question_count+1} missing options: {', '.join(missing)}")
+                if "ans" not in q or not q["ans"]:
+                    errors.append(f"⚠️ Missing ANS in Question {question_count+1}.")
+                questions.append(q)
+                question_count += 1
+                q = None
+                in_q = False
+
+            # start new question
+            q = {"raw_question": line[len("Q:"):].strip(), "options": {}, "ans": None, "exp": None, "line": idx}
             in_q = True
-            current_q = {
-                "raw_question": m_q.group(1).strip(),
-                "options": {},
-                "ans": None,
-                "exp": None,
-                "line": line_no
-            }
+            q_start_line = idx
             continue
 
-        # if not in question and line doesn't match Q or DES, treat as extra text - ignore
-        if not in_q:
-            # ignore stray lines (they may be just text like meta)
-            continue
+        # If inside question block, parse A/B/C.. / ANS / EXP
+        if in_q:
+            # ANS:
+            if line.upper().startswith("ANS:"):
+                ans_val = line[len("ANS:"):].strip()
+                if len(ans_val) == 0:
+                    errors.append(f"⚠️ Missing ANS value in Question {question_count+1}.")
+                else:
+                    # take first letter token
+                    ans_letter = ans_val.strip().upper()[0]
+                    q["ans"] = ans_letter
+                continue
 
-        # inside question block parsing
-        m_opt = _OPT_RE.match(line)
-        if m_opt:
-            label = m_opt.group(1).strip().upper()
-            text_opt = m_opt.group(2).strip()
-            # Accept only single-letter labels (A-Z)
-            if not text_opt:
-                errors.append(f"⚠️ Option {label} is empty (Question {len(questions)+1}) at line {line_no}.")
-            # overwrite if duplicate but warn
-            if label in current_q["options"]:
-                warnings.append(f"⚠️ Duplicate option {label} in Question {len(questions)+1} (line {line_no}). Overwriting.")
-            current_q["options"][label] = text_opt
-            continue
+            # EXP:
+            if line.upper().startswith("EXP:"):
+                exp_val = line[len("EXP:"):].strip()
+                # EXP must occur after ANS (rule). If ANS not yet present -> error
+                if not q.get("ans"):
+                    errors.append(f"⚠️ EXP must come after ANS (Question {question_count+1}) at line {idx}.")
+                q["exp"] = exp_val
+                continue
 
-        m_ans = _ANS_RE.match(line)
-        if m_ans:
-            ans_letter = m_ans.group(1).strip().upper()
-            # ANS must be single letter
-            if len(ans_letter) != 1:
-                errors.append(f"⚠️ Invalid ANS format in Question {len(questions)+1} at line {line_no}.")
-            current_q["ans"] = ans_letter
-            continue
+            # Option detection - prefer format "A: text" or "A) text" or "A: (A) text"
+            m = re.match(r'^(A|B|C|D|E|F|G|H|I|J|K|L)\s*[:\)]\s*(.*)$', line, re.I)
+            if m:
+                label = m.group(1).upper()
+                text_after = m.group(2).strip()
+                # If the option text contains "(A)" prefix like "(A) option", strip the leading (X)
+                if text_after.startswith("(") and ")" in text_after:
+                    # remove first "(...)" only
+                    first_close = text_after.find(")")
+                    possible = text_after[:first_close+1]
+                    # If possible is like "(A)" remove it
+                    if re.match(r'^\([A-Za-z]\)$', possible):
+                        text_after = text_after[first_close+1:].strip()
+                # store
+                if label in q["options"]:
+                    warnings.append(f"⚠️ Duplicate option {label} in Question {question_count+1} (line {idx}). Overwriting.")
+                q["options"][label] = text_after
+                continue
 
-        m_exp = _EXP_RE.match(line)
-        if m_exp:
-            # EXP must come after ANS
-            if current_q.get("ans") is None:
-                errors.append(f"⚠️ EXP must come after ANS (Question {len(questions)+1}) at line {line_no}.")
+            # Sometimes option given as "A: (A) text" or "A) (A) text" handled above; also handle "A: text" done.
+            # If line begins with "A:" but not matched, try looser regex:
+            m2 = re_label.match(line)
+            if m2 and m2.group(1).upper() in ["A","B","C","D","E","F","G","H"]:
+                label = m2.group(1).upper()
+                text_after = m2.group(2).strip()
+                if label in q["options"]:
+                    warnings.append(f"⚠️ Duplicate option {label} in Question {question_count+1} (line {idx}). Overwriting.")
+                q["options"][label] = text_after
+                continue
+
+            # If line doesn't match any expected inside a question, it's unexpected text; we treat it as continuation of last added field or add to question text
+            # Append to raw_question if no options yet
+            if not q["options"]:
+                q["raw_question"] = q["raw_question"] + " " + line
             else:
-                if current_q.get("exp") is not None:
-                    errors.append(f"⚠️ Multiple EXP found in Question {len(questions)+1} at line {line_no}.")
-                current_q["exp"] = m_exp.group(1).strip()
+                # append to last option text
+                # find last inserted option
+                last_label = None
+                if q["options"]:
+                    last_label = list(q["options"].keys())[-1]
+                if last_label:
+                    q["options"][last_label] = q["options"][last_label] + " " + line
             continue
 
-        # unknown line inside question -> treat as appended to raw_question (helps flexible formatting)
-        # but keep it safe: append to raw question text
-        current_q["raw_question"] += " " + line.strip()
+        # If not in question and not DES/Eg, ignore stray lines but warn
+        # But allow extra text before first Q (could be header). We'll ignore but not error.
+        # To avoid noisy warnings, only warn if line looks like "ANS:" or "A:" outside question
+        if line.upper().startswith(("ANS:", "A:", "B:", "C:", "D:", "EXP:")):
+            warnings.append(f"⚠️ Found {line.split()[0]} outside any question block at line {idx}. Ignored.")
+        # else ignore
 
-    # after processing all lines: finalize any open question
-    if in_q and current_q:
-        # final checks for last question
-        # must have ANS and at least A-D
-        labels = set(k.upper() for k in current_q["options"].keys())
-        required = {"A", "B", "C", "D"}
-        missing_opts = required - labels
-        q_index = len(questions) + 1
-        if missing_opts:
-            errors.append(f"⚠️ Question {q_index} missing options: {', '.join(sorted(missing_opts))}.")
-        if not current_q.get("ans"):
-            errors.append(f"⚠️ Missing ANS in Question {q_index}.")
-        else:
-            if current_q["ans"] not in labels:
-                errors.append(f"⚠️ ANS \"{current_q['ans']}\" does not match any option in Question {q_index}.")
-        # append only if structurally present (even with errors we keep it so owner can fix)
-        questions.append({
-            "raw_question": current_q["raw_question"],
-            "options": {k.upper(): v for k, v in current_q["options"].items()},
-            "ans": current_q.get("ans"),
-            "exp": current_q.get("exp"),
-            "line": current_q["line"]
-        })
-        in_q = False
-        current_q = None
-
-    # If there were earlier completed questions while parsing, we didn't append them mid-loop.
-    # The logic above appended only the last question; we need to reconstruct full questions list.
-    # To simplify and be robust: re-parse to capture all questions cleanly.
-
-    # --- strict reparse to build question list + inject DES positions properly ---
-    # We'll do a second pass which is simpler: scan lines and collect blocks.
-    questions = []
-    des_list2 = []
-    block = None
-    q_idx = 0
-    line_no = 0
-    for raw in lines:
-        line_no += 1
-        if _EG_RE.search(raw):
-            continue
-        if _DES_RE.match(raw):
-            m = _DES_RE.match(raw)
-            txt = m.group(1).strip()
-            # if we are currently building a question block (block not None), DES inside -> error
-            if block is not None and not block.get("_closed", False):
-                errors.append(f"⚠️ DES found inside question block (Question {q_idx+1}) at line {line_no}.")
-            else:
-                # assign to next question index (q_idx)
-                des_list2.append({"text": txt, "question_index": q_idx, "line": line_no})
-            continue
-        m_q = _Q_RE.match(raw)
-        if m_q:
-            # start new block
-            if block is not None and not block.get("_closed", False):
-                # previous block missing ANS -> error already caught earlier; close anyway
-                block["_closed"] = True
-                questions.append({
-                    "raw_question": block.get("raw_question", ""),
-                    "options": block.get("options", {}),
-                    "ans": block.get("ans"),
-                    "exp": block.get("exp")
-                })
-                q_idx += 1
-            block = {"raw_question": m_q.group(1).strip(), "options": {}, "ans": None, "exp": None, "_closed": False}
-            continue
-        if block is None:
-            continue
-        m_opt = _OPT_RE.match(raw)
-        if m_opt:
-            label = m_opt.group(1).upper()
-            block["options"][label] = m_opt.group(2).strip()
-            continue
-        m_ans = _ANS_RE.match(raw)
-        if m_ans:
-            block["ans"] = m_ans.group(1).upper()
-            continue
-        m_exp = _EXP_RE.match(raw)
-        if m_exp:
-            block["exp"] = m_exp.group(1).strip()
-            continue
-        # blank or other lines
-        if raw.strip() == "":
-            # ignore
-            continue
-        # unrecognized inside block -> append to question text
-        block["raw_question"] += " " + raw.strip()
-
-    # finalize last block if present
-    if block is not None:
-        questions.append({
-            "raw_question": block.get("raw_question", ""),
-            "options": {k.upper(): v for k, v in block.get("options", {}).items()},
-            "ans": block.get("ans"),
-            "exp": block.get("exp")
-        })
-
-    # final validation pass for each question
-    for idx, q in enumerate(questions, start=1):
-        labels = set(q["options"].keys())
-        required = {"A", "B", "C", "D"}
-        missing = required - labels
+    # finalize last question if open
+    if in_q and q:
+        missing = []
+        for label in ["A", "B", "C", "D"]:
+            if label not in q["options"]:
+                missing.append(label)
         if missing:
-            errors.append(f"⚠️ Question {idx} missing options: {', '.join(sorted(missing))}.")
-        if not q.get("ans"):
-            errors.append(f"⚠️ Missing ANS in Question {idx}.")
+            errors.append(f"⚠️ Question {question_count+1} missing options: {', '.join(missing)}")
+        if "ans" not in q or not q["ans"]:
+            errors.append(f"⚠️ Missing ANS in Question {question_count+1}.")
+        questions.append(q)
+        question_count += 1
+        q = None
+        in_q = False
+
+    # Validate ANS matches an option
+    for idx_q, qq in enumerate(questions, start=1):
+        if qq.get("ans"):
+            if qq["ans"] not in qq["options"]:
+                errors.append(f'⚠️ ANS "{qq.get("ans")}" does not match any option in Question {idx_q}')
         else:
-            if q["ans"] not in labels:
-                errors.append(f"⚠️ ANS \"{q['ans']}\" does not match any option in Question {idx}.")
-        # EXP after ANS already enforced in first pass; but if exp exists but ans absent we added error earlier.
+            errors.append(f"⚠️ Missing ANS in Question {idx_q}")
+
+    ok = (len(errors) == 0)
+    # pick first DES text (backwards compat)
+    first_des = des_list[0]["text"] if des_list else None
 
     result = {
-        "ok": len(errors) == 0,
+        "ok": ok,
         "errors": errors,
         "warnings": warnings,
-        "des": des_list2[0]["text"] if des_list2 else None,
-        "des_list": des_list2,
+        "des_list": des_list,
+        "des": first_des,
         "questions": questions
     }
     return result
