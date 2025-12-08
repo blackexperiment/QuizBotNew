@@ -94,16 +94,42 @@ def post_quiz_questions_background(bot, chat_id: int, parsed: dict, is_anon: boo
 
         time.sleep(delay)
 
-    # DES after polls if requested
+    # ---- Send DES after polls if requested ----
     try:
         if des and des_pos == "after":
             bot.send_message(chat_id=chat_id, text=des)
     except Exception:
         logger.exception("Failed to send DES (after).")
 
+    # ---- FRIENDLY CHAT NAME RESOLUTION ----
+    friendly_name = None
+
+    # 1) Try TARGET_CHATS mapping (from environment)
+    try:
+        from main import TARGET_CHATS
+        for name, cid in TARGET_CHATS.items():
+            if str(cid) == str(chat_id):
+                friendly_name = name
+                break
+    except Exception:
+        friendly_name = None
+
+    # 2) Try Telegram API lookup
+    if not friendly_name:
+        try:
+            chat_obj = bot.get_chat(chat_id)
+            friendly_name = getattr(chat_obj, "title", None) or getattr(chat_obj, "username", None)
+        except Exception:
+            friendly_name = None
+
+    # 3) Fallback (raw id)
+    if not friendly_name:
+        friendly_name = str(chat_id)
+
+    # ---- Notify owner ----
     if owner_id:
         try:
-            bot.send_message(owner_id, f"✅ {len(questions)} quiz(es) sent successfully to {chat_id} 🎉")
+            bot.send_message(owner_id, f"✅ {len(questions)} quiz(es) sent successfully to {friendly_name} 🎉")
         except Exception:
             logger.exception("Failed to notify owner on success.")
 
