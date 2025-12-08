@@ -1,95 +1,97 @@
 # db.py
 import sqlite3
-import threading
-import time
 import os
+import json
+import time
+from typing import Optional, Dict, Any
 
 DB_PATH = os.environ.get("DB_PATH", "./quizbot.db")
-_LOCK = threading.Lock()
 
 def _get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    with _LOCK:
-        conn = _get_conn()
-        cur = conn.cursor()
-        # jobs: id (text), payload (text), status (text), created_at (int)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                payload TEXT,
-                status TEXT,
-                created_at INTEGER
-            )
-        """)
-        # meta: key, value
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS meta (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        conn.commit()
-        conn.close()
-
-# jobs API
-def save_job(job_id: str, payload: str, status: str = "waiting_target"):
-    with _LOCK:
-        conn = _get_conn()
-        cur = conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO jobs (id, payload, status, created_at) VALUES (?, ?, ?, ?)",
-                    (job_id, payload, status, int(time.time())))
-        conn.commit()
-        conn.close()
-
-def get_job(job_id: str):
     conn = _get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT id, payload, status, created_at FROM jobs WHERE id = ?", (job_id,))
-    row = cur.fetchone()
+    # jobs table: id (text), owner_id, payload (text JSON), status, mode, created_at, expires_at
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY,
+      owner_id INTEGER NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL,
+      mode TEXT,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )
+    """)
+    # meta table for simple heartbeat or other keys
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+    """)
+    conn.commit()
     conn.close()
-    return dict(row) if row else None
 
-def update_job_status(job_id: str, status: str):
-    with _LOCK:
-        conn = _get_conn()
-        cur = conn.cursor()
-        cur.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
-        conn.commit()
-        conn.close()
-
-def get_latest_job_with_status(status: str):
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, payload, status, created_at FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT 1", (status,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-def delete_job(job_id: str):
-    with _LOCK:
-        conn = _get_conn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-        conn.commit()
-        conn.close()
-
-# meta API
 def set_meta(key: str, value: str):
-    with _LOCK:
-        conn = _get_conn()
-        cur = conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
-        conn.commit()
-        conn.close()
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
 
-def get_meta(key: str):
+def get_meta(key: str) -> Optional[str]:
     conn = _get_conn()
     cur = conn.cursor()
     cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
     row = cur.fetchone()
     conn.close()
     return row["value"] if row else None
+
+# job helpers
+def save_job_row(job_id: str, owner_id: int, payload: Dict[str, Any], status: str, expires_at: int, mode: Optional[str]=None):
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO jobs (id, owner_id, payload, status, mode, created_at, expires_at) VALUES (?,?,?,?,?,?,?)",
+                (job_id, owner_id, json.dumps(payload), status, mode, int(time.time()), expires_at))
+    conn.commit()
+    conn.close()
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "owner_id": row["owner_id"],
+        "payload": json.loads(row["payload"]),
+        "status": row["status"],
+        "mode": row["mode"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"]
+    }
+
+def update_job_status(job_id: str, status: str, mode: Optional[str]=None):
+    conn = _get_conn()
+    cur = conn.cursor()
+    if mode is not None:
+        cur.execute("UPDATE jobs SET status = ?, mode = ? WHERE id = ?", (status, mode, job_id))
+    else:
+        cur.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
+    conn.commit()
+    conn.close()
+
+def delete_job(job_id: str):
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+    conn.commit()
+    conn.close()
