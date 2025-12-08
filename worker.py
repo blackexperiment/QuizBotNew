@@ -1,122 +1,120 @@
 # worker.py
 import time
-import uuid
-import json
 import logging
-import threading
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 
-logger = logging.getLogger(__name__)
+from telegram import Bot
+from telegram.error import RetryAfter, TimedOut, NetworkError, TelegramError
 
-# default safe delays
-DEFAULT_DELAY_LESS_EQUAL_50 = 1.0
-DEFAULT_DELAY_MORE_THAN_50 = 2.0
+logger = logging.getLogger("quizbot.worker")
 
-def safe_sleep(seconds: float):
-    try:
-        time.sleep(seconds)
-    except Exception:
-        pass
-
-def post_quiz_questions(bot, chat_id: int, title: Optional[str], questions: List[Dict[str, Any]], owner_id: int):
+def _safe_send_poll(bot: Bot, chat_id: int, question: str, options: List[str], correct_option_id: int, explanation: Optional[str]=None, is_anonymous: bool=True, quiz: bool=True):
     """
-    Post a sequence of polls (quiz type) to the chat_id.
-    Each question item expected:
-    {
-      "raw_question": "...",
-      "options": {"A": "text", "B": "text", ...},
-      "ans": "B",
-      "exp": "optional explanation"
-    }
+    send_poll with retry-on-RetryAfter and basic backoff.
+    correct_option_id is index (0..)
     """
-    job_id = str(uuid.uuid4())
-    logger.info("Starting quiz job %s -> chat %s (%d questions)", job_id, chat_id, len(questions))
-    # send header if title
+    max_attempts = 4
+    attempt = 0
+    while attempt < max_attempts:
+        try:
+            if explanation:
+                # python-telegram-bot up to v13 doesn't have explanation arg for send_poll,
+                # so we send poll and then edit... but many bots simply send poll; Telegram UI shows explanation in quiz mode if provided via sendPoll's "explanation" field (API). PTB may not expose in older versions.
+                # We'll try to pass explanation (kwargs) safely; if PTB ignores it, fine.
+                poll = bot.send_poll(chat_id=chat_id, question=question, options=options, type='quiz' if quiz else 'regular',
+                                     correct_option_id=correct_option_id, is_anonymous=is_anonymous, explanation=explanation)
+            else:
+                poll = bot.send_poll(chat_id=chat_id, question=question, options=options, type='quiz' if quiz else 'regular',
+                                     correct_option_id=correct_option_id, is_anonymous=is_anonymous)
+            return True
+        except RetryAfter as e:
+            retry = int(getattr(e, "retry_after", 1))
+            logger.warning("RetryAfter received; sleeping %s seconds (attempt %d/%d)", retry, attempt+1, max_attempts)
+            time.sleep(retry)
+            attempt += 1
+            continue
+        except (TimedOut, NetworkError) as e:
+            # transient network error — exponential backoff
+            sleep_for = min(2 ** attempt, 30)
+            logger.warning("Network error sending poll: %s. Backing off %s s", e, sleep_for)
+            time.sleep(sleep_for)
+            attempt += 1
+            continue
+        except TelegramError as e:
+            # non-retryable or unknown Telegram error
+            logger.exception("TelegramError sending poll: %s", e)
+            return False
+        except Exception as e:
+            logger.exception("Unexpected error sending poll: %s", e)
+            return False
+    logger.error("Exceeded max attempts sending poll.")
+    return False
+
+
+def post_quiz_questions(bot: Bot, target_chat: int, title: Optional[str], questions: List[Dict], notify_owner_id: Optional[int] = None) -> bool:
+    """
+    posts DES (title) if present, then posts questions as polls.
+    Applies safe delay: <=50 questions -> 1s, >50 -> 2s
+    Returns True on success, False on failure.
+    Notifies owner on repeated failures.
+    """
     try:
         if title:
-            bot.send_message(chat_id, title)
-    except Exception as e:
-        logger.exception("Failed to post quiz header: %s", e)
-
-    # choose per-question delay
-    delay = DEFAULT_DELAY_LESS_EQUAL_50 if len(questions) <= 50 else DEFAULT_DELAY_MORE_THAN_50
-
-    for idx, q in enumerate(questions, start=1):
-        qtext = q.get("raw_question") or f"Question {idx}"
-        opts_map = q.get("options", {})
-        # options must be ordered alphabetically by label
-        labels = sorted(opts_map.keys())
-        options = [opts_map[lbl] or "" for lbl in labels]
-        # find index of correct option
-        ans_letter = (q.get("ans") or "").upper()
-        try:
-            correct_index = labels.index(ans_letter)
-        except ValueError:
-            # fallback: 0
-            correct_index = 0
-
-        # prepare poll; using bot.send_poll (telegram.Bot)
-        attempts = 0
-        max_attempts = 4
-        backoff = 2
-        while attempts < max_attempts:
             try:
-                # note: telegram.Bot.send_poll supports 'is_anonymous' and 'type' = 'quiz'
-                # For explanation, python-telegram-bot v13.15 supports 'explanation' argument when creating polls.
-                kwargs = dict(
-                    chat_id=chat_id,
-                    question=qtext,
-                    options=options,
-                    is_anonymous=False,  # default; owner can choose differently in UI beforehand
-                    type='quiz',
-                    correct_option_id=correct_index,
-                )
-                exp_text = q.get("exp")
-                if exp_text:
-                    # send as explanation parameter if supported
-                    kwargs['explanation'] = exp_text
+                bot.send_message(chat_id=target_chat, text=title)
+            except Exception:
+                logger.exception("Failed to post DES/title to target chat.")
 
-                bot.send_poll(**kwargs)
-                logger.info("Posted Q%d successfully", idx)
-                break
-            except Exception as exc:
-                attempts += 1
-                # inspect for RetryAfter (telegram.error.RetryAfter)
-                errstr = str(exc)
-                logger.warning("Network issue posting Q%d. Attempt %d/%d. Error: %s", idx, attempts, max_attempts, errstr)
-                # try to parse RetryAfter numeric seconds in message (common pattern)
-                retry_seconds = None
+        total_q = len(questions)
+        delay = 1 if total_q <= 50 else 2
+
+        failed_questions = []
+        for idx, q in enumerate(questions, start=1):
+            q_text = q["raw_question"]
+            # options are dict {label: text} — order by label
+            opts = [q["options"][lbl] for lbl in sorted(q["options"].keys())]
+            ans_letter = q.get("ans")
+            # convert ans_letter A/B/C... to index 0-based according to sorted labels
+            labels_sorted = sorted(q["options"].keys())
+            try:
+                correct_index = labels_sorted.index(ans_letter)
+            except ValueError:
+                correct_index = 0  # fallback to 0
+            exp = q.get("exp")
+
+            # Attempt send poll
+            ok = _safe_send_poll(bot, target_chat, q_text, opts, correct_index, explanation=exp, is_anonymous=False, quiz=True)
+            if not ok:
+                failed_questions.append((idx, q_text))
+                # retry logic: try a couple of times per question with exponential backoff (handled by _safe_send_poll)
+            time.sleep(delay)
+
+        if failed_questions:
+            # notify owner
+            msg_lines = [f"❌ Multiple failures detected while posting quiz to {target_chat}:"]
+            for fi in failed_questions[:10]:
+                msg_lines.append(f"- Q#{fi[0]} failed")
+            body = "\n".join(msg_lines)
+            logger.error(body)
+            if notify_owner_id:
                 try:
-                    # telegram.exceptions provide RetryAfter with .retry_after in some libs, but we use generic parse
-                    import re
-                    m = re.search(r'RetryAfter\((\d+)\)', errstr)
-                    if m:
-                        retry_seconds = int(m.group(1))
+                    bot.send_message(notify_owner_id, body)
                 except Exception:
-                    retry_seconds = None
+                    logger.exception("Failed to notify owner about failed questions.")
+            return False
 
-                if retry_seconds:
-                    logger.info("Honoring RetryAfter for %ds", retry_seconds)
-                    safe_sleep(retry_seconds + 0.5)
-                else:
-                    # exponential backoff
-                    safe_sleep(backoff)
-                    backoff *= 2
-
-                if attempts >= max_attempts:
-                    # notify owner and abort
-                    try:
-                        bot.send_message(owner_id, f"❌ Network issue posting Q{idx}. Aborting job {job_id} after {attempts} attempts.")
-                    except Exception:
-                        logger.exception("Failed to notify owner about abort.")
-                    logger.error("Aborting quiz job %s after repeated failures", job_id)
-                    return False
-        # after success, safe delay between polls
-        safe_sleep(delay)
-    # Success
-    try:
-        bot.send_message(owner_id, f"✅ Quiz posted successfully in chat {chat_id}. Questions: {len(questions)}")
+        # success notify owner
+        if notify_owner_id:
+            try:
+                bot.send_message(notify_owner_id, f"✅ {total_q} quiz(es) sent successfully to {target_chat} 🎉")
+            except Exception:
+                logger.exception("Failed to notify owner about success.")
+        return True
     except Exception:
-        logger.exception("Failed to send completion message to owner.")
-    logger.info("Finished quiz job %s", job_id)
-    return True
+        logger.exception("Uncaught error in post_quiz_questions")
+        if notify_owner_id:
+            try:
+                bot.send_message(notify_owner_id, "❌ Job failed due to internal error. See logs.")
+            except Exception:
+                pass
+        return False
