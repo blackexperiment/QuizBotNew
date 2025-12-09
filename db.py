@@ -15,7 +15,6 @@ def _get_conn():
 def init_db():
     conn = _get_conn()
     cur = conn.cursor()
-    # jobs table: id (text), owner_id, payload (text JSON), status, mode, created_at, expires_at
     cur.execute("""
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
@@ -27,7 +26,6 @@ def init_db():
       expires_at INTEGER NOT NULL
     )
     """)
-    # meta table for simple heartbeat or other keys
     cur.execute("""
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
@@ -52,7 +50,6 @@ def get_meta(key: str) -> Optional[str]:
     conn.close()
     return row["value"] if row else None
 
-# job helpers
 def save_job_row(job_id: str, owner_id: int, payload: Dict[str, Any], status: str, expires_at: int, mode: Optional[str]=None):
     conn = _get_conn()
     cur = conn.cursor()
@@ -65,6 +62,24 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     conn = _get_conn()
     cur = conn.cursor()
     cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "owner_id": row["owner_id"],
+        "payload": json.loads(row["payload"]),
+        "status": row["status"],
+        "mode": row["mode"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"]
+    }
+
+def find_pending_job_for_owner(owner_id: int) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM jobs WHERE owner_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1", (owner_id, "waiting_target"))
     row = cur.fetchone()
     conn.close()
     if not row:
