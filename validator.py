@@ -1,154 +1,175 @@
 # validator.py
+"""
+Lenient validator/parser per your spec.
+
+Input text -> sequence of events:
+[
+  {"type":"des","text":"..."},
+  {"type":"question",
+   "raw_question": "...",
+   "options": {"A":"...","B":"...", ...},
+   "ans": "A",
+   "exp": "..." or None
+  },
+  ...
+]
+
+Return structure:
+{
+ "ok": bool,
+ "errors": [...],
+ "warnings": [...],
+ "events": [...],
+}
+"""
+
 import re
-from typing import List, Dict, Any
 
-LINE_DES = re.compile(r'^\s*DES\s*:\s*(.*)$', re.IGNORECASE)
-LINE_Q = re.compile(r'^\s*Q\s*:\s*(.*)$', re.IGNORECASE)
-LINE_OPT = re.compile(r'^\s*([A-Z])\s*:\s*(?:\([A-Z]\)\s*)?(.*)$')  # matches "A: (A) text" or "A: text"
-LINE_ANS = re.compile(r'^\s*ANS\s*:\s*([A-Z])\s*$', re.IGNORECASE)
-LINE_EXP = re.compile(r'^\s*EXP\s*:\s*(.*)$', re.IGNORECASE)
-LINE_EG = re.compile(r'(^|\s)Eg\s*\(', re.IGNORECASE)
+_option_label_re = re.compile(r'^\s*([A-Za-z])\s*[:)\-\.]\s*(.*)$')
+# Accept lines starting "A:" or "A)" or "A-" etc when parsing options.
 
-def validate_and_parse(text: str) -> Dict[str, Any]:
-    """
-    Permissive parser using user's requested rules:
-    - Preserve order: any DES lines become sequence items at position
-    - Q blocks parsed into question items (must have A-D and ANS)
-    - EXP used only if after ANS for that question
-    - Eg( ... ) lines ignored
-    Returns dict with keys: ok, errors, warnings, sequence
-    """
+def _strip_prefix(line, prefix):
+    if line.startswith(prefix):
+        return line[len(prefix):].strip()
+    return None
+
+def validate_and_parse(text: str):
     lines = text.splitlines()
-    sequence = []
-    errors: List[str] = []
-    warnings: List[str] = []
+    errors = []
+    warnings = []
+    events = []
 
-    cur_q = None  # dict with keys raw_question, options(dict), ans, exp
-    line_no = 0
+    idx = 0
+    # We'll parse sequentially; DES lines may appear anywhere.
+    # Q blocks start with "Q:" and run until an ANS: line or next Q: or end.
+    while idx < len(lines):
+        raw = lines[idx].rstrip("\n")
+        line = raw.strip()
 
-    def flush_question():
-        nonlocal cur_q
-        if cur_q is None:
-            return
-        # minimal checks
-        opts = cur_q.get("options", {})
-        if not opts:
-            errors.append(f"⚠️ Question missing options: '{cur_q.get('raw_question','')[:40]}...'")
-            cur_q = None
-            return
-        # require at least A-D
-        required = ['A','B','C','D']
-        missing = [r for r in required if r not in opts]
-        if missing:
-            errors.append(f"⚠️ Question missing options {missing} for question '{cur_q.get('raw_question','')[:40]}...'")
-            cur_q = None
-            return
-        if not cur_q.get("ans"):
-            errors.append(f"⚠️ Missing ANS in question: '{cur_q.get('raw_question','')[:40]}...'")
-            cur_q = None
-            return
-        ans = cur_q["ans"].upper()
-        if ans not in opts:
-            errors.append(f"⚠️ ANS '{ans}' does not match available options in question '{cur_q.get('raw_question','')[:40]}...'")
-            cur_q = None
-            return
-        # normalize options: ensure values trimmed
-        cur_q["options"] = {k.strip(): v.strip() for k, v in cur_q["options"].items()}
-        sequence.append({"type":"question",
-                         "raw_question": cur_q.get("raw_question","").strip(),
-                         "options": cur_q["options"],
-                         "ans": cur_q["ans"].upper(),
-                         "exp": cur_q.get("exp")})
-        cur_q = None
+        # Ignore empty lines
+        if line == "":
+            idx += 1
+            continue
 
-    for raw in lines:
-        line_no += 1
-        if not raw or raw.strip() == "":
-            # skip blank lines
+        # Ignore Eg( ... ) lines entirely
+        if line.startswith("Eg(") or "Eg(" in line:
+            idx += 1
             continue
-        if LINE_EG.search(raw):
-            # ignore Eg( ... ) anywhere
+
+        # DES line (can be anywhere)
+        if line.startswith("DES:"):
+            des_text = raw.partition("DES:")[2].strip()
+            events.append({"type": "des", "text": des_text})
+            idx += 1
             continue
-        m = LINE_DES.match(raw)
-        if m:
-            # flush ongoing question if completed (we don't force flush if incomplete)
-            # we treat DES as a separate sequence item at this position
-            # If a question is in progress but has ANS and options, flush it first
-            if cur_q and cur_q.get("ans") and cur_q.get("options"):
-                flush_question()
-            # add DES
-            text_val = m.group(1).strip()
-            sequence.append({"type":"des","text": text_val})
-            continue
-        m = LINE_Q.match(raw)
-        if m:
-            # if currently building a question that hasn't been flushed,
-            # flush it only if it already had ANS and options (to avoid mixing); else force error and flush previous incomplete if any
-            if cur_q:
-                # if incomplete
-                if cur_q.get("ans") and cur_q.get("options"):
-                    flush_question()
-                else:
-                    # incomplete previous question: push error and drop it
-                    errors.append(f"⚠️ Incomplete previous question dropped before line {line_no}.")
-                    cur_q = None
-            cur_q = {"raw_question": m.group(1).strip(), "options": {}, "ans": None, "exp": None}
-            continue
-        m = LINE_ANS.match(raw)
-        if m:
-            if cur_q is None:
-                errors.append(f"⚠️ ANS without a question at line {line_no}.")
-                continue
-            cur_q["ans"] = m.group(1).strip().upper()
-            continue
-        m = LINE_EXP.match(raw)
-        if m:
-            if cur_q is None:
-                # EXP outside question -> treat as DES-like message? per user, EXP belongs to previous question only; otherwise ignore
-                warnings.append(f"⚠️ EXP found outside question at line {line_no}; ignoring.")
-                continue
-            # EXP must be after ANS to be valid here. If ANS missing, record error.
-            if not cur_q.get("ans"):
-                errors.append(f"⚠️ EXP found before ANS (line {line_no}). Move EXP after ANS.")
-                # still attach it but mark error
-                cur_q["exp"] = m.group(1).strip()
+
+        # Q block start
+        if line.startswith("Q:"):
+            q_text = raw.partition("Q:")[2].strip()
+            idx += 1
+            # collect option lines until ANS: or next Q: or DES:
+            options = {}
+            ans = None
+            exp = None
+            raw_question = q_text
+
+            # Read following lines that belong to this question block
+            while idx < len(lines):
+                l_raw = lines[idx].rstrip("\n")
+                l = l_raw.strip()
+                # If next question starts or DES or another top-level marker -> stop
+                if l.startswith("Q:") or l.startswith("DES:"):
+                    break
+                if l.startswith("Eg(") or "Eg(" in l:
+                    idx += 1
+                    continue
+                # ANS:
+                if l.upper().startswith("ANS:"):
+                    val = l_raw.partition(":")[2].strip()
+                    if val == "":
+                        errors.append(f"Missing ANS value at line {idx+1}")
+                    else:
+                        # Normalize to single letter (first non-space character)
+                        m = re.search(r'([A-Za-z])', val)
+                        if m:
+                            ans = m.group(1).upper()
+                        else:
+                            errors.append(f"Invalid ANS value at line {idx+1}: {val!r}")
+                    idx += 1
+                    continue
+                # EXP:
+                if l.upper().startswith("EXP:"):
+                    exp_text = l_raw.partition(":")[2].strip()
+                    exp = exp_text
+                    idx += 1
+                    continue
+                # Option candidate: lines starting with A: or A) etc or lines beginning with 'A: (' pattern used in your example
+                opt_match = None
+                # direct "A: (A) text" or "A: (A)text" or "A: text"
+                if re.match(r'^[A-Za-z]\s*[:)\-\.]', l_raw):
+                    # try label split
+                    m = re.match(r'^\s*([A-Za-z])\s*[:)\-\.]\s*(.*)$', l_raw)
+                    if m:
+                        label = m.group(1).upper()
+                        text_opt = m.group(2).strip()
+                        options[label] = text_opt
+                        idx += 1
+                        continue
+                # also accept lines that start with "(A)" or "(A) text"
+                m2 = re.match(r'^\s*\(?([A-Za-z])\)?\s*(?:[:)\-\.])?\s*(.*)$', l_raw)
+                if m2 and l_raw.strip().startswith("("):
+                    label = m2.group(1).upper()
+                    options[label] = m2.group(2).strip()
+                    idx += 1
+                    continue
+
+                # If line contains "A: (A) text" style where label repeated inside parentheses,
+                if ":" in l_raw:
+                    left, _, right = l_raw.partition(":")
+                    left = left.strip()
+                    if len(left) == 1 and left.isalpha():
+                        options[left.upper()] = right.strip()
+                        idx += 1
+                        continue
+
+                # Otherwise it's likely extra text or part of question continuation
+                # If options empty yet, append to question text (multi-line question)
+                if not options and ans is None and exp is None:
+                    raw_question += " " + l_raw.strip()
+                    idx += 1
+                    continue
+
+                # If we reached here, treat as unknown line inside question -> append as warning and skip
+                warnings.append(f"Ignored line inside question at {idx+1}: {l_raw}")
+                idx += 1
+
+            # End of inner loop for Q block
+
+            # Minimal checks: must have at least A-D and ans must be one of present options
+            # We require at least A,B,C,D labels present, but be lenient: if user provided less it's an error.
+            required_labels = ["A", "B", "C", "D"]
+            for rlbl in required_labels:
+                if rlbl not in options:
+                    errors.append(f"Option {rlbl} missing for question starting at line {idx+1 - len(options) - 1}")
+            if ans is None:
+                errors.append(f"Missing ANS for question starting with Q: {raw_question[:50]!r}")
             else:
-                cur_q["exp"] = m.group(1).strip()
-            continue
-        m = LINE_OPT.match(raw)
-        if m:
-            # option like 'A: (A) text' or 'A: text'
-            lab = m.group(1).strip().upper()
-            txt = m.group(2).strip()
-            if not cur_q:
-                errors.append(f"⚠️ Option {lab} found outside a question at line {line_no}. Ignoring.")
-                continue
-            # if duplicate label warn and overwrite
-            if lab in cur_q["options"]:
-                warnings.append(f"⚠️ Duplicate option {lab} in question '{cur_q.get('raw_question','')[:40]}'. Overwriting.")
-            cur_q["options"][lab] = txt
-            continue
-        # If line doesn't match any recognized token, treat as continuation of previous question text if inside question
-        if cur_q:
-            # append to raw_question or to last option if last option exists?
-            # Simple behavior: append to raw_question if no options yet, else append to last option text.
-            if not cur_q["options"]:
-                cur_q["raw_question"] += " " + raw.strip()
-            else:
-                # append to last option added
-                last_lab = sorted(cur_q["options"].keys())[-1]
-                cur_q["options"][last_lab] += " " + raw.strip()
-            continue
-        # otherwise if free text outside anything, treat as DES (user wanted permissive behavior)
-        sequence.append({"type":"des","text": raw.strip()})
+                if ans not in options:
+                    errors.append(f'ANS "{ans}" does not match any option for question: {raw_question[:40]!r}')
 
-    # end for lines
-    # flush last question if present
-    if cur_q:
-        if cur_q.get("ans") and cur_q.get("options"):
-            flush_question()
-        else:
-            errors.append("⚠️ Last question incomplete or missing ANS/options.")
+            events.append({
+                "type": "question",
+                "raw_question": raw_question,
+                "options": options,
+                "ans": ans,
+                "exp": exp
+            })
+            continue
+
+        # Any other line that is not DES or Q or Eg() -> treat as stray text (we'll make it a DES)
+        # This keeps behavior lenient: stray text is treated as DES message.
+        events.append({"type": "des", "text": raw})
+        idx += 1
 
     ok = len(errors) == 0
-    return {"ok": ok, "errors": errors, "warnings": warnings, "sequence": sequence}
+    return {"ok": ok, "errors": errors, "warnings": warnings, "events": events}
