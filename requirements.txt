@@ -3,7 +3,6 @@ Flask==2.3.2
 redis==5.0.1
 rq==1.15.1
 requests==2.31.0
-urllib3==1.26.16
 APScheduler==3.6.3
 pytz==2025.2
 tzlocal==5.3.1
