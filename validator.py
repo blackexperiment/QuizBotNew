@@ -1,129 +1,83 @@
-# validator.py
-# Very simple, robust parser that never rejects DES inside question blocks.
-# It produces a clean "sequence" list preserving exact input order.
+# db.py
+import sqlite3
+import time
+import json
+from typing import Optional, Any
 
-import re
+DEFAULT_DB = "./quizbot.db"
 
-def validate_and_parse(text: str):
-    lines = text.splitlines()
-    sequence = []
-    errors = []
-    warnings = []
+_conn = None
 
-    current_q = None  # None OR dict of an active question block
-    waiting_options = False  # True once Q: has been seen
+def _get_conn(path: Optional[str]=None):
+    global _conn
+    if _conn:
+        return _conn
+    db_path = path or DEFAULT_DB
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    # create tables if not exists
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        owner_id INTEGER,
+        payload TEXT,
+        status TEXT,
+        created_at INTEGER
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+    conn.commit()
+    _conn = conn
+    return _conn
 
-    def flush_question():
-        """Push current_q into sequence if valid."""
-        if not current_q:
-            return
+def init_db(path: Optional[str]=None):
+    _get_conn(path)
 
-        # Must have A–D
-        opts = current_q.get("options", {})
-        for letter in ["A", "B", "C", "D"]:
-            if letter not in opts:
-                errors.append(f"Missing option {letter} for question: {current_q['raw_question']}")
-                return
+def save_job(job_id: str, owner_id: int, payload: dict, status: str="waiting"):
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO jobs (id, owner_id, payload, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                (job_id, owner_id, json.dumps(payload, ensure_ascii=False), status, int(time.time())))
+    conn.commit()
 
-        # Must have ANS and it must exist among options
-        ans = current_q.get("ans")
-        if not ans:
-            errors.append(f"Missing ANS for question: {current_q['raw_question']}")
-            return
-        if ans not in opts:
-            errors.append(f"ANS {ans} does not match any option in question: {current_q['raw_question']}")
-            return
+def get_job(job_id: str) -> Optional[dict]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {"id": r["id"], "owner_id": r["owner_id"], "payload": json.loads(r["payload"]), "status": r["status"], "created_at": r["created_at"]}
 
-        # Valid – add to sequence
-        sequence.append(current_q.copy())
+def pop_next_waiting():
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM jobs WHERE status IN ('waiting','queued') ORDER BY created_at ASC LIMIT 1")
+    r = cur.fetchone()
+    if not r:
+        return None
+    job = {"id": r["id"], "owner_id": r["owner_id"], "payload": json.loads(r["payload"]), "status": r["status"], "created_at": r["created_at"]}
+    cur.execute("DELETE FROM jobs WHERE id = ?", (r["id"],))
+    conn.commit()
+    return job
 
-    # ---------------------------------------------------------
-    # MAIN LOOP
-    # ---------------------------------------------------------
-    for raw in lines:
-        line = raw.strip()
-        if not line:
-            continue
+def set_meta(key: str, value: Any):
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, json.dumps(value, ensure_ascii=False)))
+    conn.commit()
 
-        # Eg() → ignore
-        if line.lower().startswith("eg("):
-            continue
-
-        # -----------------------------
-        # DES line
-        # -----------------------------
-        if line.lower().startswith("des:"):
-            des_text = line[4:].strip()
-            # If in middle of question block: still allowed (your rule)
-            # Push DES as its own sequence item
-            sequence.append({"type": "des", "text": des_text})
-            continue
-
-        # -----------------------------
-        # Q: new question starts
-        # -----------------------------
-        if line.lower().startswith("q:"):
-            # If previous question exists → flush it
-            if current_q:
-                flush_question()
-            # Start new question
-            question_text = line[2:].strip()
-            current_q = {
-                "type": "question",
-                "raw_question": question_text,
-                "options": {},
-                "ans": None,
-                "exp": None,
-            }
-            waiting_options = True
-            continue
-
-        # If inside question block:
-        if current_q:
-            # -----------------------------
-            # A:, B:, C:, ... any option
-            # -----------------------------
-            m_opt = re.match(r"([A-Z]):\s*(.*)", line)
-            if m_opt:
-                label = m_opt.group(1).upper()
-                text_val = m_opt.group(2).strip()
-                # Save option
-                current_q["options"][label] = text_val
-                continue
-
-            # -----------------------------
-            # ANS:
-            # -----------------------------
-            if line.lower().startswith("ans:"):
-                ans_letter = line[4:].strip().upper()
-                current_q["ans"] = ans_letter
-                continue
-
-            # -----------------------------
-            # EXP:
-            # -----------------------------
-            if line.lower().startswith("exp:"):
-                exp_text = line[4:].strip()
-                current_q["exp"] = exp_text
-                continue
-
-            # If a line appears here that does not match anything:
-            # You said extra text should NOT break anything → ignore it.
-            continue
-
-        # -----------------------------
-        # Any other text outside Q block → ignore
-        # -----------------------------
-        continue
-
-    # Final flush
-    if current_q:
-        flush_question()
-
-    # Done
-    return {
-        "ok": len(errors) == 0,
-        "errors": errors,
-        "warnings": warnings,
-        "sequence": sequence
-    }
+def get_meta(key: str):
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    return json.loads(r["value"])
