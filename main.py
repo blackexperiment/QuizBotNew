@@ -1,63 +1,61 @@
 # main.py
 import os
 import logging
-import threading
 import time
+import threading
 import json
-from typing import Optional, Dict, Any
+from typing import Dict, Set
 
 from flask import Flask, jsonify
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
 
-# local modules (assumed to exist)
 import db
+from validator import validate_and_parse
 import worker
-from validator import validate_and_parse  # your validator (must follow requested contract)
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("quizbot")
 
-# --- Config from env ---
+# Config
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN not set. Exiting.")
     raise SystemExit("TELEGRAM_BOT_TOKEN required")
 
-# numeric owner(s)
 SUDO_USERS = os.environ.get("SUDO_USERS", "")
-SUDO_USERS_SET = set()
-for x in [s.strip() for s in SUDO_USERS.split(",") if s.strip()]:
-    try:
-        SUDO_USERS_SET.add(int(x))
-    except Exception:
-        pass
-
-# TARGET_CHATS format: Name:id,Name2:id2
-TARGET_CHATS_RAW = os.environ.get("TARGET_CHATS", "")
-TARGET_CHATS: Dict[str, int] = {}
-for pair in [p.strip() for p in TARGET_CHATS_RAW.split(",") if p.strip()]:
-    if ":" in pair:
-        name, cid = pair.split(":", 1)
-        name = name.strip()
+SUDO_USERS_SET: Set[int] = set()
+if SUDO_USERS:
+    for s in SUDO_USERS.split(","):
         try:
-            TARGET_CHATS[name] = int(cid.strip())
+            SUDO_USERS_SET.add(int(s.strip()))
         except Exception:
-            logger.warning("Invalid TARGET_CHATS id for %s -> %s", name, cid)
+            continue
 
-# timing and retry config
-POLL_DELAY_SHORT = float(os.environ.get("POLL_DELAY_SHORT", "1"))
-POLL_DELAY_LONG = float(os.environ.get("POLL_DELAY_LONG", "2"))
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "4"))
-SEQUENTIAL_FAIL_ABORT = int(os.environ.get("SEQUENTIAL_FAIL_ABORT", "3"))
+TARGET_CHATS_ENV = os.environ.get("TARGET_CHATS", "")
+def parse_target_chats(env: str):
+    out = {}
+    if not env:
+        return out
+    for p in [x.strip() for x in env.split(",") if x.strip()]:
+        if ":" in p:
+            name, cid = p.split(":",1)
+            try:
+                out[name.strip()] = int(cid.strip())
+            except:
+                continue
+    return out
 
-# initialize db (assumes db.init_db exists)
-db.init_db()
+TARGET_CHATS_MAP = parse_target_chats(TARGET_CHATS_ENV)
 
-# Flask health app
+DB_PATH = os.environ.get("DB_PATH", "./quizbot.db")
+
+# init db
+db.init_db(DB_PATH)
+
+# Flask app for health
 app = Flask(__name__)
-
 @app.route("/")
 def index():
     return "OK", 200
@@ -65,235 +63,219 @@ def index():
 @app.route("/health")
 def health():
     hb = db.get_meta("last_heartbeat") or ""
-    return jsonify({"status": "ok", "last_heartbeat": hb}), 200
+    return jsonify({"status":"ok", "last_heartbeat": hb}), 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# Telegram bot
+# Bot
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-def is_owner(user_id: int) -> bool:
-    return int(user_id) in SUDO_USERS_SET
+def kb_choose_anonymous(job_id: str):
+    # callback_data encodes job + choice
+    kb = [
+        [InlineKeyboardButton("Public", callback_data=json.dumps({"job": job_id, "type":"public"}))],
+        [InlineKeyboardButton("Anonymous", callback_data=json.dumps({"job": job_id, "type":"anonymous"}))]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def kb_choose_chat(job_id: str, type_choice: str):
+    kb = []
+    for name, cid in TARGET_CHATS_MAP.items():
+        payload = {"job": job_id, "type": type_choice, "chat_id": cid}
+        kb.append([InlineKeyboardButton(name, callback_data=json.dumps(payload))])
+    return InlineKeyboardMarkup(kb)
 
 # /start
 def start_cmd(update: Update, context: CallbackContext):
     uid = update.effective_user.id if update.effective_user else None
-    if uid and is_owner(uid):
+    if uid in SUDO_USERS_SET:
         msg = "🛡️ BLACK RHINO CONTROL PANEL\n🚀 Send a pre-formatted quiz message and I'll post it as polls."
-        context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
     else:
-        context.bot.send_message(chat_id=update.effective_chat.id,
-                                 text="🚫 This is a private bot. This bot is restricted and can be used only by the authorized owner.")
+        msg = "🚫 This is a private bot. This bot is restricted and can be used only by the authorized owner."
+    context.bot.send_message(chat_id=update.effective_chat.id, text=msg)
 
-def help_cmd(update: Update, context: CallbackContext):
-    context.bot.send_message(chat_id=update.effective_chat.id,
-                             text="Send formatted quiz text (owner only).")
-
-# Helper to build inline keyboards
-def kb_choose_anonymous(job_id: str):
-    buttons = [
-        InlineKeyboardButton("Anonymous ✅", callback_data=json.dumps({"act": "choose_type", "job": job_id, "anon": True})),
-        InlineKeyboardButton("Public ✅", callback_data=json.dumps({"act": "choose_type", "job": job_id, "anon": False}))
-    ]
-    return InlineKeyboardMarkup([buttons])
-
-def kb_choose_chat(job_id: str):
-    # arrange one button per row with chat name as label and callback_data containing chat id
-    rows = []
-    for name, cid in TARGET_CHATS.items():
-        rows.append([InlineKeyboardButton(name, callback_data=json.dumps({"act": "choose_chat", "job": job_id, "chat_id": int(cid)}))])
-    return InlineKeyboardMarkup(rows)
-
-# When owner sends formatted text
+# handle formatted messages from owners (permissive)
 def owner_message_handler(update: Update, context: CallbackContext):
     if update.effective_user is None:
         return
     uid = update.effective_user.id
-    if not is_owner(uid):
+    if uid not in SUDO_USERS_SET:
         logger.info("Ignored message from non-owner: %s", uid)
         return
-
     text = (update.effective_message.text or "").strip()
     if not text:
         context.bot.send_message(uid, "Empty message.")
         return
-
-    # Validate input (validator should produce sequence ideally)
+    # quick ack
+    context.bot.send_message(uid, "✅ Received. Quick validation in progress...")
+    # validate
     res = validate_and_parse(text)
     if not isinstance(res, dict):
-        context.bot.send_message(uid, "Validator returned invalid structure. See logs.")
-        logger.error("Validator returned non-dict: %r", res)
+        context.bot.send_message(uid, "Validator returned unexpected result.")
         return
-
     if not res.get("ok", False):
-        errs = "\n".join(res.get("errors", []))
-        warns = "\n".join(res.get("warnings", []))
-        reply = f"⚠️ Format errors:\n{errs}"
+        errs = res.get("errors", []) or []
+        warns = res.get("warnings", []) or []
+        reply = ""
+        if errs:
+            reply += "⚠️ Format errors:\n" + "\n".join(errs) + "\n"
         if warns:
-            reply += f"\n⚠️ Warnings:\n{warns}"
-        context.bot.send_message(chat_id=uid, text=reply)
+            reply += "⚠️ Warnings:\n" + "\n".join(warns)
+        context.bot.send_message(uid, reply or "Validation failed.")
         return
-
-    # Build a canonical sequence list that preserves DES positions if validator provided sequence.
-    sequence = res.get("sequence")
-    if not sequence:
-        # fallback: put des (if any) before questions — validator ideally should return sequence to preserve positions
-        sequence = []
-        des_text = res.get("des")
-        if des_text:
-            sequence.append({"type": "des", "text": des_text})
-        for q in res.get("questions", []):
-            sequence.append({"type": "question", **q})
-
-    # Save job in bot_data store with a job_id
+    # ok -> create job id and save sequence in memory (context.bot_data) and DB for persistence
     job_id = f"job:{int(time.time()*1000)}:{uid}"
-    pending_jobs = context.bot_data.setdefault("pending_jobs", {})
-    pending_jobs[job_id] = {"owner_id": uid, "sequence": sequence}
-    # Ask user to choose Anonymous/Public (no Cancel)
-    context.bot.send_message(uid, "Choose poll type:", reply_markup=kb_choose_anonymous(job_id))
+    sequence = res.get("sequence", [])
+    # save to context and to DB
+    pending = context.bot_data.setdefault("pending_jobs", {})
+    pending[job_id] = {"owner_id": uid, "sequence": sequence}
+    db.save_job(job_id=job_id, owner_id=uid, payload={"sequence": sequence}, status="waiting")
+    # ask for public/anonymous
+    context.bot.send_message(uid, "Choose poll type (no cancel):", reply_markup=kb_choose_anonymous(job_id))
 
-# Callback handler for both type and chat choice
-def callback_query_router(update: Update, context: CallbackContext):
-    q = update.callback_query
-    if not q or not q.data:
+# callback when owner chooses public/anonymous
+def callback_choose_type(update: Update, context: CallbackContext):
+    query = update.callback_query
+    if not query:
         return
-    uid = q.from_user.id if q.from_user else None
+    data = query.data
     try:
-        payload = json.loads(q.data)
+        payload = json.loads(data)
     except Exception:
-        q.answer("Invalid action")
+        query.answer("Invalid action.")
         return
-
-    act = payload.get("act")
     job_id = payload.get("job")
-    if act == "choose_type":
-        # owner chose anonymous/public: show chat choices
-        if not job_id or job_id not in context.bot_data.get("pending_jobs", {}):
-            q.answer("Job not found or expired.")
-            return
-        is_anon = bool(payload.get("anon"))
-        # store choice
-        choices = context.bot_data.setdefault("pending_choices", {})
-        choices[job_id] = {"is_anonymous": is_anon}
-        # show chat selection keyboard (no Cancel)
-        q.answer()  # toast
-        q.edit_message_text("Choose where to post the quiz:")
-        q.edit_message_reply_markup(reply_markup=kb_choose_chat(job_id))
+    choice = payload.get("type")
+    if not job_id or choice not in ("public","anonymous"):
+        query.answer("Invalid selection.")
         return
-
-    if act == "choose_chat":
-        # owner chose chat — start posting (background thread)
-        if not job_id or job_id not in context.bot_data.get("pending_jobs", {}):
-            q.answer("Job not found or expired.")
+    # verify job exists in context or DB
+    pending = context.bot_data.get("pending_jobs", {})
+    job = pending.get(job_id)
+    if not job:
+        # try DB
+        j = db.get_job(job_id)
+        if j:
+            job = {"owner_id": j["owner_id"], "sequence": j["payload"].get("sequence")}
+            pending[job_id] = job
+        else:
+            query.answer("Job not found or expired.")
             return
-        chat_id = payload.get("chat_id")
-        if chat_id is None:
-            q.answer("Invalid chat")
-            return
+    # ask to choose chat
+    query.answer(f"Selected {choice}. Now choose target chat.")
+    query.edit_message_text(text=f"Selected {choice}. Now pick chat to post:", reply_markup=kb_choose_chat(job_id, choice))
 
-        # check and fetch job
-        job = context.bot_data["pending_jobs"].pop(job_id, None)
-        # merge choices
-        choice = context.bot_data.get("pending_choices", {}).pop(job_id, {})
-        if not job:
-            q.answer("Job not found or expired.")
-            return
-        owner_id = job.get("owner_id")
-        is_anonymous = choice.get("is_anonymous", False)
-
-        # Acknowledge without posting a visible 'Queued' message
-        q.answer("Starting posting…")
-
-        # guard against double start for same job
-        running = context.bot_data.setdefault("running_jobs", set())
-        if job_id in running:
-            q.answer("Job already running.")
-            return
-        running.add(job_id)
-
-        # determine chat_name from TARGET_CHATS mapping (reverse lookup)
-        chat_name = None
-        for name, cid in TARGET_CHATS.items():
-            if int(cid) == int(chat_id):
-                chat_name = name
-                break
-
-        # launch background worker
-        def run_job():
-            try:
-                sent = worker.post_sequence(
-                    bot=context.bot,
-                    chat_id=int(chat_id),
-                    sequence=job.get("sequence", []),
-                    is_anonymous=is_anonymous,
-                    owner_id=owner_id,
-                    chat_name=chat_name,
-                    poll_delay_short=POLL_DELAY_SHORT,
-                    poll_delay_long=POLL_DELAY_LONG,
-                    max_retries=MAX_RETRIES,
-                    sequential_fail_abort=SEQUENTIAL_FAIL_ABORT,
-                    job_id=job_id
-                )
-                # send final owner confirmation (worker will also attempt; this is safe guard)
-                if owner_id and sent:
-                    try:
-                        name = chat_name if chat_name else str(chat_id)
-                        context.bot.send_message(owner_id, f"✅ {sent} quiz(es) sent successfully to {name} 🎉")
-                    except Exception:
-                        logger.exception("Failed to send owner confirmation from main thread.")
-            except Exception:
-                logger.exception("Uncaught error in run_job thread")
-            finally:
-                # remove running guard
-                try:
-                    context.bot_data.get("running_jobs", set()).discard(job_id)
-                except Exception:
-                    pass
-
-        threading.Thread(target=run_job, daemon=True).start()
-        # update message text to reflect started (only edit message)
-        q.edit_message_text("Posting started. You will receive a confirmation when done.")
+# callback when owner chooses chat
+def callback_choose_chat(update: Update, context: CallbackContext):
+    query = update.callback_query
+    if not query:
         return
+    try:
+        payload = json.loads(query.data)
+    except Exception:
+        query.answer("Invalid action.")
+        return
+    job_id = payload.get("job")
+    ctype = payload.get("type")
+    chat_id = payload.get("chat_id")
+    if not job_id or ctype not in ("public","anonymous") or not chat_id:
+        query.answer("Invalid action.")
+        return
+    # find job
+    pending = context.bot_data.get("pending_jobs", {})
+    job = pending.get(job_id)
+    if not job:
+        j = db.get_job(job_id)
+        if j:
+            job = {"owner_id": j["owner_id"], "sequence": j["payload"].get("sequence")}
+            pending[job_id] = job
+        else:
+            query.answer("Job not found or expired.")
+            return
+    # run posting in background thread so callback returns quickly
+    owner_id = job.get("owner_id")
+    sequence = job.get("sequence", [])
+    # remove job (one-shot)
+    try:
+        pending.pop(job_id, None)
+    except:
+        pass
+    # mark DB job queued
+    db.save_job(job_id=job_id, owner_id=owner_id, payload={"sequence": sequence}, status="queued")
+    query.answer("Posting started.")
+    query.edit_message_text(text=f"Posting to selected chat...")
 
-    # unknown action
-    q.answer("Unknown action")
+    def do_post():
+        try:
+            chat_name = None
+            # find name
+            for name, cid in TARGET_CHATS_MAP.items():
+                if cid == chat_id:
+                    chat_name = name
+                    break
+            anonymous = True if ctype == "anonymous" else False
+            ok = worker.post_sequence(context.bot, chat_id, sequence, anonymous, owner_id=owner_id, chat_name=chat_name)
+            # after posting, remove DB job
+            # we saved earlier; now delete
+            # (pop_next_waiting will delete older ones; to keep it simple just delete by id)
+            # We'll reuse db.get_job to check, then delete by marking status done
+            if ok:
+                db.set_meta("last_job_success", {"job_id": job_id, "owner": owner_id, "chat": chat_name, "sent": True, "time": int(time.time())})
+            else:
+                db.set_meta("last_job_success", {"job_id": job_id, "owner": owner_id, "chat": chat_name, "sent": False, "time": int(time.time())})
+        except Exception:
+            logger.exception("Error in do_post thread for job %s", job_id)
+
+    th = threading.Thread(target=do_post, daemon=True)
+    th.start()
+
+# helper: a tiny debug command to list target chats
+def list_chats_cmd(update: Update, context: CallbackContext):
+    uid = update.effective_user.id if update.effective_user else None
+    if uid not in SUDO_USERS_SET:
+        update.message.reply_text("Not allowed.")
+        return
+    if not TARGET_CHATS_MAP:
+        update.message.reply_text("No target chats configured in TARGET_CHATS.")
+        return
+    text = "Configured target chats:\n"
+    for name, cid in TARGET_CHATS_MAP.items():
+        text += f"- {name}: {cid}\n"
+    update.message.reply_text(text)
 
 def main():
-    # run flask health server in background so main thread handles polling
+    # run flask in thread
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
     updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
+
+    # commands
     dp.add_handler(CommandHandler("start", start_cmd))
-    dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(CommandHandler("list_chats", list_chats_cmd))
 
-    # Owner message handler: messages that contain 'Q:' go to owner handler
-    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=list(SUDO_USERS_SET)) & Filters.regex(r'Q:'), owner_message_handler))
-    # generic owner message fallback (if they reply with something else)
-    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=list(SUDO_USERS_SET)), lambda u,c: c.bot.send_message(u.effective_chat.id, "Send formatted quiz text (must contain Q:)")))
+    # message handler for owner formatted text
+    dp.add_handler(MessageHandler(Filters.text & Filters.user(user_id=list(SUDO_USERS_SET)), owner_message_handler))
 
-    dp.add_handler(CallbackQueryHandler(callback_query_router))
+    # callbacks
+    dp.add_handler(CallbackQueryHandler(callback_choose_type, pattern=r'^\{.*"type"\s*:\s*".*"\}'))
+    dp.add_handler(CallbackQueryHandler(callback_choose_chat, pattern=r'^\{.*"chat_id".*\}'))
 
-    # Start polling in main thread (so updater.idle won't raise signal error)
+    # Start polling in main thread (so signal works)
     logger.info("Starting polling (main thread)...")
     updater.start_polling(poll_interval=1.0, timeout=20)
+    # heartbeat meta update
     try:
-        # heartbeat meta update
         while True:
-            ts = str(int(time.time()))
-            try:
-                db.set_meta("last_heartbeat", ts)
-            except Exception:
-                logger.exception("Failed to set heartbeat.")
+            db.set_meta("last_heartbeat", int(time.time()))
             time.sleep(30)
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received; shutting down.")
+        logger.info("Shutting down...")
     finally:
         updater.stop()
-        logger.info("Bot stopped.")
 
 if __name__ == "__main__":
     main()
