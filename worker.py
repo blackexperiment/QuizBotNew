@@ -1,208 +1,139 @@
 # worker.py
 import time
 import logging
-from typing import List, Dict, Any, Optional
-
-from telegram import Bot
-from telegram.error import RetryAfter, TelegramError
-
-# if you have db.mark_job_done, try to use it for idempotency; otherwise we'll use in-memory guard
-import db
+from typing import Dict, List, Any, Optional
+import os
 
 logger = logging.getLogger("quizbot.worker")
 
-# in-process notified guard (avoid duplicate final confirmations)
-_notified_jobs = set()
+# config from env (fall back to defaults)
+POLL_DELAY_SHORT = float(os.environ.get("POLL_DELAY_SHORT", "1"))
+POLL_DELAY_LONG = float(os.environ.get("POLL_DELAY_LONG", "2"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "4"))
+SEQUENTIAL_FAIL_ABORT = int(os.environ.get("SEQUENTIAL_FAIL_ABORT", "3"))
 
-def _letter_to_index(letter: str, ordered_labels: List[str]) -> Optional[int]:
-    """
-    Map option letter like 'A' to index in ordered_labels list (ordered_labels contains labels like ['A','B','C'...'])
-    """
-    letter_u = (letter or "").strip().upper()
-    if not letter_u:
-        return None
-    try:
-        return ordered_labels.index(letter_u)
-    except ValueError:
-        return None
-
-def post_sequence(
-    bot: Bot,
-    chat_id: int,
-    sequence: List[Dict[str, Any]],
-    is_anonymous: bool = False,
-    owner_id: Optional[int] = None,
-    chat_name: Optional[str] = None,
-    poll_delay_short: float = 1.0,
-    poll_delay_long: float = 2.0,
-    max_retries: int = 4,
-    sequential_fail_abort: int = 3,
-    job_id: Optional[str] = None
-) -> int:
-    """
-    Post the sequence (list of dicts) into chat_id.
-    sequence items:
-     - {"type":"des", "text": "..."}
-     - {"type":"question", "raw_question": "...", "options": {"A":"...","B":"..."}, "ans":"A", "exp":"..."}
-    Returns number of polls successfully sent (int) or 0 on failure.
-    """
-    sent_count = 0
-    consecutive_failures = 0
-
-    for idx, item in enumerate(sequence, start=1):
-        try:
-            if item.get("type") == "des":
-                # send DES as a normal message in-order
-                try:
-                    bot.send_message(chat_id=chat_id, text=item.get("text", ""))
-                except Exception:
-                    logger.exception("Failed to send DES at index %s", idx)
-                # continue to next element
+# TARGET_CHATS env format: Name:chatid,Name2:chatid2
+def parse_target_chats(env: Optional[str]=None) -> Dict[str, int]:
+    env = env or os.environ.get("TARGET_CHATS", "")
+    out = {}
+    if not env:
+        return out
+    parts = [p.strip() for p in env.split(",") if p.strip()]
+    for p in parts:
+        if ":" in p:
+            name, cid = p.split(":", 1)
+            try:
+                out[name.strip()] = int(cid.strip())
+            except Exception:
+                # ignore bad
                 continue
+    return out
 
-            if item.get("type") == "question":
-                qtext = item.get("raw_question") or item.get("question") or ""
-                options_map = item.get("options", {}) or {}
-                # Order options by sorted label A,B,C... to maintain consistency
-                ordered_labels = sorted(options_map.keys())
-                # Build list of option texts preserving alphabetical label order
-                option_texts = [options_map.get(lbl, "") for lbl in ordered_labels]
-                # map ANS letter to index in that list
-                ans_letter = (item.get("ans") or "").strip().upper()
-                correct_index = _letter_to_index(ans_letter, ordered_labels)
-                # validation: require at least 2 options and correct_index valid
-                if len(option_texts) < 2 or correct_index is None:
-                    logger.error("Invalid question format at seq index %s: options=%s ans=%s", idx, ordered_labels, ans_letter)
-                    # treat as failure and continue or abort according to policy
-                    consecutive_failures += 1
-                    if consecutive_failures >= sequential_fail_abort:
-                        # abort job and notify owner
-                        try:
-                            if owner_id:
-                                bot.send_message(owner_id, f"❌ Aborting: too many sequential failures (question index {idx}).")
-                        except Exception:
-                            logger.exception("Failed to notify owner about abort.")
-                        return sent_count
-                    # skip this question
-                    continue
+TARGET_CHATS_MAP = parse_target_chats()
 
-                # Prepare explanation (EXP)
-                explanation = item.get("exp") or None
+def _send_des(bot, chat_id: int, text: str):
+    try:
+        bot.send_message(chat_id=chat_id, text=text)
+        return True
+    except Exception as e:
+        logger.exception("Failed to send DES to %s: %s", chat_id, e)
+        return False
 
-                # Try sending poll with retries and handling RetryAfter
-                attempt = 0
-                while attempt < max_retries:
-                    try:
-                        # send_poll uses correct_option_id index
-                        # python-telegram-bot 13's send_poll may accept 'explanation' param via Bot API though PTB v13 sometimes
-                        # We'll call bot.send_poll and include explanation if API supports it. If not supported, fallback to sending separate msg.
-                        poll = bot.send_poll(
-                            chat_id=chat_id,
-                            question=qtext,
-                            options=option_texts,
-                            is_anonymous=is_anonymous,
-                            type="quiz",
-                            correct_option_id=correct_index,
-                            explanation=explanation if explanation else None
-                        )
-                        sent_count += 1
-                        consecutive_failures = 0
-                        # after posting poll, sleep appropriate delay
-                        # small heuristics: if many questions, use long delay
-                        if len(sequence) <= 50:
-                            time.sleep(poll_delay_short)
-                        else:
-                            time.sleep(poll_delay_long)
-                        break  # success -> leave retry loop
-                    except RetryAfter as ra:
-                        # if API asks to wait, honor it
-                        wait = getattr(ra, "retry_after", None) or 1
-                        logger.warning("RetryAfter(%s) for question index %s — sleeping %s s", ra, idx, wait)
-                        time.sleep(wait)
-                        attempt += 1
-                        continue
-                    except TelegramError as te:
-                        # network / api errors; retry with backoff
-                        attempt += 1
-                        backoff = min(2 ** attempt, 30)
-                        logger.exception("TelegramError posting question idx %s attempt %s: %s, retrying in %s s", idx, attempt, te, backoff)
-                        time.sleep(backoff)
-                        continue
-                    except Exception as exc:
-                        attempt += 1
-                        backoff = min(2 ** attempt, 30)
-                        logger.exception("Unexpected error posting question idx %s attempt %s: %s", idx, attempt, exc)
-                        time.sleep(backoff)
-                        continue
-                else:
-                    # exhausted retries for this question
-                    consecutive_failures += 1
-                    logger.error("Exhausted retries for question index %s. Skipping.", idx)
+def _send_poll(bot, chat_id: int, q: Dict[str, Any], anonymous: bool):
+    """
+    q: {"raw_question":..., "options": {A: text,...}, "ans":"A", "exp": optional}
+    returns True/False
+    """
+    question = q.get("raw_question")
+    options_map = q.get("options", {})
+    # Order options by letter A,B,C...
+    labels = sorted(options_map.keys())
+    opts = [options_map[k] for k in labels]
+    # correct index
+    try:
+        correct_idx = labels.index(q.get("ans").upper())
+    except Exception:
+        correct_idx = None
+
+    # make retries
+    attempt = 0
+    while attempt < MAX_RETRIES:
+        try:
+            # send_poll: use send_poll for quizzes
+            # python-telegram-bot v13: bot.send_poll(chat_id, question, options,
+            # options as list, is_anonymous=anonymous, type='quiz', correct_option_id=correct_idx, explanation=exp)
+            exp = q.get("exp")
+            if correct_idx is None:
+                # fallback: send a normal poll (non-quiz)
+                bot.send_poll(chat_id=chat_id, question=question, options=opts, is_anonymous=anonymous)
+            else:
+                # include explanation if provided
+                kwargs = {"is_anonymous": anonymous, "type": "quiz", "correct_option_id": correct_idx}
+                if exp:
+                    # explanation supported in modern PTB; include but safe-guard with try/except
+                    kwargs["explanation"] = exp
+                bot.send_poll(chat_id=chat_id, question=question, options=opts, **kwargs)
+            return True
+        except Exception as e:
+            attempt += 1
+            logger.exception("Failed to send poll (attempt %d/%d) to %s: %s", attempt, MAX_RETRIES, chat_id, e)
+            # exponential backoff
+            time.sleep(min(2 ** attempt, 8))
+    return False
+
+def post_sequence(bot, chat_id: int, sequence: List[Dict[str, Any]], anonymous: bool, owner_id: Optional[int]=None, chat_name: Optional[str]=None) -> bool:
+    """
+    Post sequence (list of DES and question items) to chat_id in order.
+    Returns True on full success (every question posted), False if aborted.
+    """
+    if chat_name is None:
+        # try find name
+        for k, v in TARGET_CHATS_MAP.items():
+            if v == chat_id:
+                chat_name = k
+                break
+    chat_name = chat_name or str(chat_id)
+
+    fail_count = 0
+    sent_questions = 0
+
+    for item in sequence:
+        if item.get("type") == "des":
+            ok = _send_des(bot, chat_id, item.get("text",""))
+            # DES shouldn't affect fail_count if it fails; we log
+            if not ok:
+                logger.warning("DES send failed for chat %s", chat_id)
+            # small gap
+            time.sleep(0.2)
+            continue
+        if item.get("type") == "question":
+            ok = _send_poll(bot, chat_id, item, anonymous)
+            if not ok:
+                fail_count += 1
+                logger.warning("Question post failed (count %d) for chat %s", fail_count, chat_id)
+                if fail_count >= SEQUENTIAL_FAIL_ABORT:
+                    # abort
                     if owner_id:
                         try:
-                            bot.send_message(owner_id, f"❌ Failed to post question #{idx}. Aborting job.")
+                            bot.send_message(owner_id, f"❌ Aborting job: multiple failures posting to {chat_name}.")
                         except Exception:
-                            logger.exception("Failed to notify owner about question failure.")
-                    if consecutive_failures >= sequential_fail_abort:
-                        if owner_id:
-                            try:
-                                bot.send_message(owner_id, f"❌ Aborted job due to repeated failures at question #{idx}.")
-                            except Exception:
-                                logger.exception("Failed to notify owner on abort.")
-                        return sent_count
-                    continue
-
+                            logger.exception("Failed to notify owner of abort.")
+                    return False
             else:
-                logger.warning("Unknown sequence item at index %s: %s", idx, item)
-                continue
-
-        except Exception:
-            logger.exception("Unhandled exception while processing sequence index %s", idx)
-            consecutive_failures += 1
-            if consecutive_failures >= sequential_fail_abort:
-                if owner_id:
-                    try:
-                        bot.send_message(owner_id, f"❌ Aborted job due to repeated unhandled exceptions at index {idx}.")
-                    except Exception:
-                        logger.exception("Failed to notify owner on abort.")
-                return sent_count
+                sent_questions += 1
+                # reset consecutive failures on success
+                fail_count = 0
+            # apply delay based on number of questions (simple rule)
+            # if total > 50 use long delay
+            delay = POLL_DELAY_SHORT if sent_questions <= 50 else POLL_DELAY_LONG
+            time.sleep(delay)
             continue
-
-    # job done — final single confirmation (idempotent)
-    try:
-        notified = False
-        # try DB-level idempotency if available
-        if job_id:
-            try:
-                # db.mark_job_done should return True if it marked now, False if already marked earlier.
-                if hasattr(db, "mark_job_done"):
-                    notified = not db.mark_job_done(job_id)  # mark_job_done returns False if already done, True if newly marked
-                    # We want notified == False to mean NOT notified yet. So invert logic.
-                    # If db.mark_job_done returns True (newly marked) -> we should notify now (so notified False)
-                    # If returns False (already done) -> notified True (so skip)
-                    notified = False if db.mark_job_done(job_id) else True
-                else:
-                    notified = False
-            except Exception:
-                logger.exception("db.mark_job_done() failed; falling back to in-memory guard.")
-                notified = False
-
-        # in-memory fallback guard
-        if not notified:
-            if job_id:
-                key = job_id
-            else:
-                key = f"{chat_id}:{owner_id}:{sent_count}"
-            if key in _notified_jobs:
-                notified = True
-            else:
-                _notified_jobs.add(key)
-                notified = False
-
-        if not notified and owner_id:
-            name = chat_name if chat_name else str(chat_id)
-            bot.send_message(owner_id, f"✅ {sent_count} quiz(es) sent successfully to {name} 🎉")
-    except Exception:
-        logger.exception("Failed to send final owner confirmation.")
-
-    return sent_count
+        # unknown type: ignore
+    # done
+    # notify owner
+    if owner_id:
+        try:
+            bot.send_message(owner_id, f"✅ {sent_questions} quiz(es) sent successfully to {chat_name} 🎉")
+        except Exception:
+            logger.exception("Failed to notify owner on success.")
+    return True
