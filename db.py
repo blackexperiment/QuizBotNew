@@ -1,112 +1,59 @@
 # db.py
-import sqlite3
 import os
-import json
-import time
-from typing import Optional, Dict, Any
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, JSON, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from datetime import datetime
 
-DB_PATH = os.environ.get("DB_PATH", "./quizbot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot.db")
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
 
-def _get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(Integer, unique=True, index=True, nullable=False)
+    username = Column(String, nullable=True)
+    role = Column(String, default="teacher")  # 'owner' or 'teacher'
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Chat(Base):
+    __tablename__ = "chats"
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, unique=True, nullable=False)
+    name = Column(String, nullable=False)
+    owner_telegram_id = Column(Integer, nullable=True)  # who added (owner/teacher)
+    is_global = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Job(Base):
+    __tablename__ = "bulk_jobs"
+    id = Column(Integer, primary_key=True, index=True)
+    created_by = Column(Integer, nullable=False)  # telegram id
+    raw_text = Column(Text, nullable=False)
+    status = Column(String, default="pending")
+    total_actions = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Action(Base):
+    __tablename__ = "actions"
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(Integer, ForeignKey("bulk_jobs.id", ondelete="CASCADE"))
+    seq = Column(Integer, nullable=False)
+    type = Column(String, nullable=False)  # MSG or POLL
+    payload = Column(JSON, nullable=False)
+    status = Column(String, default="pending")
+
+class JobTarget(Base):
+    __tablename__ = "job_targets"
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(Integer, ForeignKey("bulk_jobs.id", ondelete="CASCADE"))
+    chat_id = Column(Integer, nullable=False)
+    status = Column(String, default="pending")
 
 def init_db():
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS jobs (
-      id TEXT PRIMARY KEY,
-      owner_id INTEGER NOT NULL,
-      payload TEXT NOT NULL,
-      status TEXT NOT NULL,
-      mode TEXT,
-      created_at INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL
-    )
-    """)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS meta (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    )
-    """)
-    conn.commit()
-    conn.close()
+    Base.metadata.create_all(bind=engine)
 
-def set_meta(key: str, value: str):
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
-
-def get_meta(key: str) -> Optional[str]:
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM meta WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row["value"] if row else None
-
-def save_job_row(job_id: str, owner_id: int, payload: Dict[str, Any], status: str, expires_at: int, mode: Optional[str]=None):
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO jobs (id, owner_id, payload, status, mode, created_at, expires_at) VALUES (?,?,?,?,?,?,?)",
-                (job_id, owner_id, json.dumps(payload), status, mode, int(time.time()), expires_at))
-    conn.commit()
-    conn.close()
-
-def get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {
-        "id": row["id"],
-        "owner_id": row["owner_id"],
-        "payload": json.loads(row["payload"]),
-        "status": row["status"],
-        "mode": row["mode"],
-        "created_at": row["created_at"],
-        "expires_at": row["expires_at"]
-    }
-
-def find_pending_job_for_owner(owner_id: int) -> Optional[Dict[str, Any]]:
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM jobs WHERE owner_id = ? AND status = ? ORDER BY created_at DESC LIMIT 1", (owner_id, "waiting_target"))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {
-        "id": row["id"],
-        "owner_id": row["owner_id"],
-        "payload": json.loads(row["payload"]),
-        "status": row["status"],
-        "mode": row["mode"],
-        "created_at": row["created_at"],
-        "expires_at": row["expires_at"]
-    }
-
-def update_job_status(job_id: str, status: str, mode: Optional[str]=None):
-    conn = _get_conn()
-    cur = conn.cursor()
-    if mode is not None:
-        cur.execute("UPDATE jobs SET status = ?, mode = ? WHERE id = ?", (status, mode, job_id))
-    else:
-        cur.execute("UPDATE jobs SET status = ? WHERE id = ?", (status, job_id))
-    conn.commit()
-    conn.close()
-
-def delete_job(job_id: str):
-    conn = _get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-    conn.commit()
-    conn.close()
+def get_session():
+    return SessionLocal()
